@@ -1,0 +1,9 @@
+# 出力ファイル
+02_output/*.xlsx
+
+# アーカイブ済みCSV
+99_archive/*.csv
+
+# Python
+__pycache__/
+*.pyc
