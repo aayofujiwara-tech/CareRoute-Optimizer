@@ -391,7 +391,8 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
 
         if not candidates:
             slot_label = TIME_SLOTS[start_idx]
-            msg = f"  [警告] {date_display} {slot_label}の{user_name}様を担当できるスタッフがいません"
+            bldg_info = f" ({task_building})" if task_building else ""
+            msg = f"  [警告] {date_display} {slot_label}の{user_name}様{bldg_info}を担当できるスタッフがいません"
             warnings.append(msg)
             continue
 
@@ -501,13 +502,17 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             name_cell.font = FONT_CELL
             name_cell.alignment = ALIGN_CENTER
 
-            # 全スロットに罫線を設定
+            # 全スロットに罫線を設定 + NG時間帯に「休憩」表示
+            ng_range = staff_row["NG時間帯"]
             for slot_idx in range(len(TIME_SLOTS)):
                 col = slot_idx + 3
                 cell = ws.cell(row=current_row, column=col)
                 cell.border = THIN_BORDER
                 cell.font = FONT_CELL
                 cell.alignment = ALIGN_CENTER
+                if is_in_ng_range(TIME_SLOTS[slot_idx], ng_range):
+                    cell.value = "休憩"
+                    cell.fill = FILL_HEADER
 
             # 割り当て済みタスクを書き込む
             for slot_indices, task_row in assignments.get(staff_name, []):
@@ -652,8 +657,10 @@ def main():
     print("\n[6/7] 割り当て結果...")
     if warnings:
         print(f"  割り当て不能タスク: {len(warnings)} 件")
-        for w in warnings:
+        for w in warnings[:5]:
             print(w)
+        if len(warnings) > 5:
+            print(f"  ...他 {len(warnings) - 5} 件")
     else:
         print("  全タスクを正常に割り当てました")
 
