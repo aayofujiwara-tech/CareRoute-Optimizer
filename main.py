@@ -2,7 +2,7 @@
 訪問看護・介護スケジュール自動生成システム - CareRoute Optimizer
 
 Excel形式の入力ファイルをフォルダ監視型で読み込み、
-Greedyアルゴリズムで動線（階数移動）を最小化しながら
+スコアリング方式（負荷平準化 + 動線最適化）で
 1タスク=1スタッフの割り当てを行い、
 ガントチャート風マトリクス形式のExcelを出力する。
 """
@@ -250,12 +250,38 @@ def is_within_shift(slot_label, shift_start_str, shift_end_str):
 # Greedy 割り当てロジック
 # ====================================================================
 
-def assign_tasks_for_date(day_staff_df, day_tasks, date_display):
-    """1日分のタスクをスタッフに貪欲法で割り当てる。
+def compute_route_bonus(task_floor, task_address, last_floor, last_address):
+    """動線ボーナスを計算する。
+
+    - 同じ階: 30pt (ランク3つ分相当)
+    - 同じ建物 (住所一致): 10pt
+    - それ以外: 0pt
+    """
+    if last_floor is None:
+        return 0
+    if last_floor == task_floor:
+        return 30
+    if last_address and task_address and last_address == task_address:
+        return 10
+    return 0
+
+
+def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
+    """1日分のタスクをスコアリング方式で割り当てる。
+
+    Score = (累積ランク合計 * 10) - 動線ボーナス
+    スコアが低いスタッフが優先的に選ばれる。
+    累積ランクは日をまたいで引き継ぎ、負荷を全日程で平準化する。
+
+    Args:
+        carry_over: dict[staff_name] -> {"cumulative_rank": int, ...}
+            前日までの累積状態。この日の出勤者のみ使用する。
 
     Returns:
         assignments: dict[staff_name] -> list of (slot_indices, task_row)
-        warnings: list of str (割り当て不能タスクの警告メッセージ)
+        warnings: list of str
+        day_stats: dict[staff_name] -> {"count": int, "total_rank": int}
+        carry_over: 更新済みの累積状態
     """
     warnings = []
 
@@ -267,14 +293,20 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display):
             "shift_start": str(row["開始時間"]).strip(),
             "shift_end": str(row["終了時間"]).strip(),
             "ng_range": row["NG時間帯"],
-            "occupied_slots": set(),  # 使用済みスロットインデックス
+            "occupied_slots": set(),
         }
 
-    # 各スタッフが最後にいた階数 (動線最小化用)
-    staff_last_floor = {name: None for name in staff_info}
+    # 累積状態を引き継ぐ (初出のスタッフは0初期化)
+    for name in staff_info:
+        if name not in carry_over:
+            carry_over[name] = {"cumulative_rank": 0}
 
-    # 割り当て結果: staff_name -> [(slot_indices, task_row), ...]
+    # 当日の動線追跡 (日ごとにリセット)
+    staff_last_floor = {name: None for name in staff_info}
+    staff_last_address = {name: None for name in staff_info}
+
     assignments = {name: [] for name in staff_info}
+    day_stats = {name: {"count": 0, "total_rank": 0} for name in staff_info}
 
     # タスクを順に処理
     for _, task_row in day_tasks.iterrows():
@@ -283,23 +315,22 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display):
         if start_idx is None:
             continue
 
-        # 所要時間 → スロット数
         try:
             duration_min = int(task_row["所要時間"])
         except (ValueError, TypeError):
             duration_min = 30
         slot_count = max(1, duration_min // 30)
 
-        # 必要なスロットインデックスのリスト
         needed_slots = list(range(start_idx, min(start_idx + slot_count, len(TIME_SLOTS))))
 
         user_name = safe_str(task_row["利用者名"])
         task_floor = safe_int(task_row.get("階数", None), default=0)
+        task_address = safe_str(task_row.get("住所", None), default="")
+        task_rank = safe_int(task_row.get("ランク", None), default=1)
 
         # 候補スタッフをリストアップ
         candidates = []
         for staff_name, info in staff_info.items():
-            # 全スロットがシフト時間内か
             all_in_shift = all(
                 is_within_shift(TIME_SLOTS[idx], info["shift_start"], info["shift_end"])
                 for idx in needed_slots
@@ -307,7 +338,6 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display):
             if not all_in_shift:
                 continue
 
-            # NG時間帯に重なっていないか
             any_ng = any(
                 is_in_ng_range(TIME_SLOTS[idx], info["ng_range"])
                 for idx in needed_slots
@@ -315,7 +345,6 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display):
             if any_ng:
                 continue
 
-            # 既に使用済みのスロットと重複していないか
             if info["occupied_slots"] & set(needed_slots):
                 continue
 
@@ -327,30 +356,26 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display):
             warnings.append(msg)
             continue
 
-        # 最適なスタッフを選択 (同じ階のスタッフを最優先)
-        best = None
-        for c in candidates:
-            if staff_last_floor[c] is not None and staff_last_floor[c] == task_floor:
-                best = c
-                break
+        # スコアリングで最適スタッフを選択
+        def calc_score(name):
+            bonus = compute_route_bonus(
+                task_floor, task_address,
+                staff_last_floor[name], staff_last_address[name],
+            )
+            return (carry_over[name]["cumulative_rank"] * 10) - bonus
 
-        # 同じ階のスタッフがいなければ、階数差が最小のスタッフ
-        if best is None:
-            def floor_distance(name):
-                last = staff_last_floor[name]
-                if last is None:
-                    return 0  # 未訪問なら移動コスト0とみなす
-                return abs(last - task_floor)
-
-            candidates.sort(key=floor_distance)
-            best = candidates[0]
+        best = min(candidates, key=calc_score)
 
         # 割り当て実行
         staff_info[best]["occupied_slots"].update(needed_slots)
         staff_last_floor[best] = task_floor
+        staff_last_address[best] = task_address
+        carry_over[best]["cumulative_rank"] += task_rank
+        day_stats[best]["count"] += 1
+        day_stats[best]["total_rank"] += task_rank
         assignments[best].append((needed_slots, task_row))
 
-    return assignments, warnings
+    return assignments, warnings, day_stats, carry_over
 
 
 # ====================================================================
@@ -376,6 +401,9 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
     dates = staff_shift_df["日付"].unique()
     current_row = 2
     all_warnings = []
+    # 全日程を通じたスタッフ別統計・累積状態
+    global_stats = {}
+    carry_over = {}  # 日をまたいで累積ランクを引き継ぐ
 
     # ケアプランを曜日別に整理
     tasks_by_weekday = {}
@@ -403,12 +431,17 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
         else:
             day_tasks_df = pd.DataFrame()
 
-        # Greedy割り当て実行
+        # スコアリング割り当て実行
         if not day_tasks_df.empty:
-            assignments, warnings = assign_tasks_for_date(
-                day_staff_df, day_tasks_df, date_display
+            assignments, warnings, day_stats, carry_over = assign_tasks_for_date(
+                day_staff_df, day_tasks_df, date_display, carry_over
             )
             all_warnings.extend(warnings)
+            for name, stats in day_stats.items():
+                if name not in global_stats:
+                    global_stats[name] = {"count": 0, "total_rank": 0}
+                global_stats[name]["count"] += stats["count"]
+                global_stats[name]["total_rank"] += stats["total_rank"]
         else:
             assignments = {row["スタッフ名"]: [] for _, row in day_staff_df.iterrows()}
 
@@ -439,7 +472,13 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             for slot_indices, task_row in assignments.get(staff_name, []):
                 user_name = safe_str(task_row["利用者名"])
                 room = safe_str(task_row.get("部屋番号", None), default="")
-                display_text = f"{user_name}\n({room})" if room else user_name
+                service = safe_str(task_row.get("サービス種類", None), default="")
+                if room and service:
+                    display_text = f"{user_name}\n{room} ({service})"
+                elif room:
+                    display_text = f"{user_name}\n{room}"
+                else:
+                    display_text = user_name
                 fill = get_fill_for_user(task_row)
 
                 for idx in slot_indices:
@@ -473,7 +512,7 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
         print(f"  原因: {e}")
         sys.exit(1)
 
-    return filepath, all_warnings
+    return filepath, all_warnings, global_stats
 
 
 # ====================================================================
@@ -527,13 +566,16 @@ def main():
     print("\n[4/7] データ結合...")
     merged = care_plan.merge(medical_master, on="利用者名", how="left")
 
-    # 階数・部屋番号が無い場合に備えてデフォルト値を補填
+    # オプション列が無い場合に備えてデフォルト値を補填
     if "階数" not in merged.columns:
         merged["階数"] = 0
         print("  [情報] マスタに「階数」列がないため、全件 0 で補填しました")
     if "部屋番号" not in merged.columns:
         merged["部屋番号"] = ""
         print("  [情報] マスタに「部屋番号」列がないため、空文字で補填しました")
+    if "ランク" not in merged.columns:
+        merged["ランク"] = 1
+        print("  [情報] ケアプランに「ランク」列がないため、全件 1 で補填しました")
 
     # ソート: 階数 (昇順) > 部屋番号 (昇順) > 固定時間指定 (昇順)
     merged["_sort_floor"] = merged["階数"].apply(lambda v: safe_int(v, 0))
@@ -548,8 +590,10 @@ def main():
     print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件 (階数→部屋→時間でソート済)")
 
     # 5. 割り当て & Excel生成
-    print("\n[5/7] Greedy割り当て & マトリクスExcel生成...")
-    output_path, warnings = build_matrix_excel(staff_shift, merged, timestamp_str)
+    print("\n[5/7] スコアリング割り当て & マトリクスExcel生成...")
+    output_path, warnings, global_stats = build_matrix_excel(
+        staff_shift, merged, timestamp_str
+    )
 
     # 6. 割り当て結果サマリ
     print("\n[6/7] 割り当て結果...")
@@ -559,6 +603,19 @@ def main():
             print(w)
     else:
         print("  全タスクを正常に割り当てました")
+
+    # 負荷分散サマリ
+    if global_stats:
+        print("\n  --- スタッフ別 負荷サマリ ---")
+        print(f"  {'スタッフ名':　<10s}  件数  トータルランク")
+        print(f"  {'-' * 36}")
+        for name in sorted(global_stats.keys()):
+            s = global_stats[name]
+            print(f"  {name:　<10s}  {s['count']:>4d}  {s['total_rank']:>14d}")
+        total_count = sum(s["count"] for s in global_stats.values())
+        total_rank = sum(s["total_rank"] for s in global_stats.values())
+        print(f"  {'-' * 36}")
+        print(f"  {'合計':　<10s}  {total_count:>4d}  {total_rank:>14d}")
 
     # 7. アーカイブ
     print("\n[7/7] アーカイブ処理...")
