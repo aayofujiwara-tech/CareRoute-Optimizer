@@ -2,7 +2,8 @@
 訪問看護・介護スケジュール自動生成システム - CareRoute Optimizer
 
 Excel形式の入力ファイルをフォルダ監視型で読み込み、
-横軸に時間(30分刻み)・縦軸にスタッフを配置した
+Greedyアルゴリズムで動線（階数移動）を最小化しながら
+1タスク=1スタッフの割り当てを行い、
 ガントチャート風マトリクス形式のExcelを出力する。
 """
 
@@ -100,7 +101,6 @@ def find_excel_in_folder(folder_key):
     folder_name = folder_key
 
     xlsx_files = sorted(glob.glob(os.path.join(folder_path, "*.xlsx")))
-    # 一時ファイル (~$...) を除外
     xlsx_files = [f for f in xlsx_files if not os.path.basename(f).startswith("~$")]
 
     if not xlsx_files:
@@ -113,7 +113,6 @@ def find_excel_in_folder(folder_key):
         print(f"  {label}: {os.path.basename(chosen)}")
         return chosen
 
-    # 複数ファイルがある場合 → 更新日時が最新のものを選択
     xlsx_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
     chosen = xlsx_files[0]
     print(f"  [警告] {folder_name}フォルダに複数のExcelファイルがあります ({len(xlsx_files)}件)")
@@ -138,7 +137,6 @@ def load_excel(filepath, folder_key):
         print(f"  原因: {e}")
         sys.exit(1)
 
-    # 必須カラムの存在チェック
     required = config["required_columns"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -166,6 +164,23 @@ def normalize_boolean(value):
     return False
 
 
+def safe_str(value, default="不明"):
+    """値を安全に文字列化する。NaN や None は default を返す。"""
+    if pd.isna(value):
+        return default
+    return str(value).strip()
+
+
+def safe_int(value, default=0):
+    """値を安全に整数化する。変換できなければ default を返す。"""
+    if pd.isna(value):
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
 def get_fill_for_user(row):
     """利用者の保険判定に基づく背景色を返す (優先順位付き)。"""
     if normalize_boolean(row.get("判定_障がい", False)):
@@ -179,14 +194,12 @@ def parse_time(time_str):
     """時間文字列 (HH:MM) を datetime.time に変換する。"""
     if pd.isna(time_str) or str(time_str).strip() == "":
         return None
-    s = str(time_str).strip()
-    # datetime オブジェクトがそのまま入っている場合に対応
     if hasattr(time_str, "hour"):
         return time_str if hasattr(time_str, "second") else None
+    s = str(time_str).strip()
     try:
         return datetime.strptime(s, "%H:%M").time()
     except ValueError:
-        # "09:00:00" のような秒付きフォーマットにも対応
         try:
             return datetime.strptime(s, "%H:%M:%S").time()
         except ValueError:
@@ -234,11 +247,118 @@ def is_within_shift(slot_label, shift_start_str, shift_end_str):
 
 
 # ====================================================================
+# Greedy 割り当てロジック
+# ====================================================================
+
+def assign_tasks_for_date(day_staff_df, day_tasks, date_display):
+    """1日分のタスクをスタッフに貪欲法で割り当てる。
+
+    Returns:
+        assignments: dict[staff_name] -> list of (slot_indices, task_row)
+        warnings: list of str (割り当て不能タスクの警告メッセージ)
+    """
+    warnings = []
+
+    # スタッフごとの情報を構造化
+    staff_info = {}
+    for _, row in day_staff_df.iterrows():
+        name = row["スタッフ名"]
+        staff_info[name] = {
+            "shift_start": str(row["開始時間"]).strip(),
+            "shift_end": str(row["終了時間"]).strip(),
+            "ng_range": row["NG時間帯"],
+            "occupied_slots": set(),  # 使用済みスロットインデックス
+        }
+
+    # 各スタッフが最後にいた階数 (動線最小化用)
+    staff_last_floor = {name: None for name in staff_info}
+
+    # 割り当て結果: staff_name -> [(slot_indices, task_row), ...]
+    assignments = {name: [] for name in staff_info}
+
+    # タスクを順に処理
+    for _, task_row in day_tasks.iterrows():
+        fixed_time = str(task_row["固定時間指定"]).strip()
+        start_idx = time_to_slot_index(fixed_time)
+        if start_idx is None:
+            continue
+
+        # 所要時間 → スロット数
+        try:
+            duration_min = int(task_row["所要時間"])
+        except (ValueError, TypeError):
+            duration_min = 30
+        slot_count = max(1, duration_min // 30)
+
+        # 必要なスロットインデックスのリスト
+        needed_slots = list(range(start_idx, min(start_idx + slot_count, len(TIME_SLOTS))))
+
+        user_name = safe_str(task_row["利用者名"])
+        task_floor = safe_int(task_row.get("階数", None), default=0)
+
+        # 候補スタッフをリストアップ
+        candidates = []
+        for staff_name, info in staff_info.items():
+            # 全スロットがシフト時間内か
+            all_in_shift = all(
+                is_within_shift(TIME_SLOTS[idx], info["shift_start"], info["shift_end"])
+                for idx in needed_slots
+            )
+            if not all_in_shift:
+                continue
+
+            # NG時間帯に重なっていないか
+            any_ng = any(
+                is_in_ng_range(TIME_SLOTS[idx], info["ng_range"])
+                for idx in needed_slots
+            )
+            if any_ng:
+                continue
+
+            # 既に使用済みのスロットと重複していないか
+            if info["occupied_slots"] & set(needed_slots):
+                continue
+
+            candidates.append(staff_name)
+
+        if not candidates:
+            slot_label = TIME_SLOTS[start_idx]
+            msg = f"  [警告] {date_display} {slot_label}の{user_name}様を担当できるスタッフがいません"
+            warnings.append(msg)
+            continue
+
+        # 最適なスタッフを選択 (同じ階のスタッフを最優先)
+        best = None
+        for c in candidates:
+            if staff_last_floor[c] is not None and staff_last_floor[c] == task_floor:
+                best = c
+                break
+
+        # 同じ階のスタッフがいなければ、階数差が最小のスタッフ
+        if best is None:
+            def floor_distance(name):
+                last = staff_last_floor[name]
+                if last is None:
+                    return 0  # 未訪問なら移動コスト0とみなす
+                return abs(last - task_floor)
+
+            candidates.sort(key=floor_distance)
+            best = candidates[0]
+
+        # 割り当て実行
+        staff_info[best]["occupied_slots"].update(needed_slots)
+        staff_last_floor[best] = task_floor
+        assignments[best].append((needed_slots, task_row))
+
+    return assignments, warnings
+
+
+# ====================================================================
 # Excel生成 (マトリクスレイアウト)
 # ====================================================================
 
 def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
-    """ガントチャート風マトリクスExcelを生成する。"""
+    """割り当て結果をガントチャート風マトリクスExcelとして出力する。"""
     wb = Workbook()
     ws = wb.active
     ws.title = "週間スケジュール"
@@ -252,7 +372,12 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
         cell.border = THIN_BORDER
         cell.alignment = ALIGN_CENTER
 
-    # --- ケアプランを曜日別に整理 ---
+    # --- 日付ごとに割り当て → 書き込み ---
+    dates = staff_shift_df["日付"].unique()
+    current_row = 2
+    all_warnings = []
+
+    # ケアプランを曜日別に整理
     tasks_by_weekday = {}
     for _, task_row in merged_df.iterrows():
         weekday = str(task_row["曜日"]).strip()
@@ -260,12 +385,7 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             tasks_by_weekday[weekday] = []
         tasks_by_weekday[weekday].append(task_row)
 
-    # --- 日付ごと・スタッフごとに行を生成 ---
-    dates = staff_shift_df["日付"].unique()
-    current_row = 2
-
     for date_val in sorted(dates):
-        # 日付から曜日を取得
         try:
             date_obj = pd.to_datetime(date_val)
             weekday_jp = WEEKDAY_JP[date_obj.weekday()]
@@ -274,13 +394,27 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             weekday_jp = None
             date_display = str(date_val)
 
-        day_staff = staff_shift_df[staff_shift_df["日付"] == date_val]
+        day_staff_df = staff_shift_df[staff_shift_df["日付"] == date_val]
 
-        for _, staff_row in day_staff.iterrows():
+        # この曜日のタスクを取得してソート済みDataFrameにする
+        day_task_list = tasks_by_weekday.get(weekday_jp, [])
+        if day_task_list:
+            day_tasks_df = pd.DataFrame(day_task_list)
+        else:
+            day_tasks_df = pd.DataFrame()
+
+        # Greedy割り当て実行
+        if not day_tasks_df.empty:
+            assignments, warnings = assign_tasks_for_date(
+                day_staff_df, day_tasks_df, date_display
+            )
+            all_warnings.extend(warnings)
+        else:
+            assignments = {row["スタッフ名"]: [] for _, row in day_staff_df.iterrows()}
+
+        # 各スタッフの行を書き込む
+        for _, staff_row in day_staff_df.iterrows():
             staff_name = staff_row["スタッフ名"]
-            shift_start = str(staff_row["開始時間"]).strip()
-            shift_end = str(staff_row["終了時間"]).strip()
-            ng_range = staff_row["NG時間帯"]
 
             # A列: 日付, B列: スタッフ名
             date_cell = ws.cell(row=current_row, column=1, value=date_display)
@@ -293,7 +427,7 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             name_cell.font = FONT_CELL
             name_cell.alignment = ALIGN_CENTER
 
-            # 各タイムスロットのセルを初期化 (罫線のみ)
+            # 全スロットに罫線を設定
             for slot_idx in range(len(TIME_SLOTS)):
                 col = slot_idx + 3
                 cell = ws.cell(row=current_row, column=col)
@@ -301,51 +435,18 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
                 cell.font = FONT_CELL
                 cell.alignment = ALIGN_CENTER
 
-            # タスクの配置
-            if weekday_jp and weekday_jp in tasks_by_weekday:
-                for task_row in tasks_by_weekday[weekday_jp]:
-                    fixed_time = str(task_row["固定時間指定"]).strip()
-                    start_idx = time_to_slot_index(fixed_time)
-                    if start_idx is None:
-                        continue
+            # 割り当て済みタスクを書き込む
+            for slot_indices, task_row in assignments.get(staff_name, []):
+                user_name = safe_str(task_row["利用者名"])
+                room = safe_str(task_row.get("部屋番号", None), default="")
+                display_text = f"{user_name}\n({room})" if room else user_name
+                fill = get_fill_for_user(task_row)
 
-                    # 所要時間からスロット数を計算
-                    try:
-                        duration_min = int(task_row["所要時間"])
-                    except (ValueError, TypeError):
-                        duration_min = 30
-                    slot_count = max(1, duration_min // 30)
-
-                    # 開始時刻がシフト時間内か・NG時間帯でないか
-                    slot_label = TIME_SLOTS[start_idx]
-                    if not is_within_shift(slot_label, shift_start, shift_end):
-                        continue
-                    if is_in_ng_range(slot_label, ng_range):
-                        continue
-
-                    user_name = str(task_row["利用者名"])
-                    service = str(task_row["サービス種類"])
-                    display_text = f"{user_name}\n({service})"
-                    fill = get_fill_for_user(task_row)
-
-                    # 所要時間分のスロットにタスクを書き込む
-                    for offset in range(slot_count):
-                        idx = start_idx + offset
-                        if idx >= len(TIME_SLOTS):
-                            break
-                        target_slot = TIME_SLOTS[idx]
-                        if not is_within_shift(target_slot, shift_start, shift_end):
-                            break
-                        if is_in_ng_range(target_slot, ng_range):
-                            break
-
-                        col = idx + 3
-                        cell = ws.cell(row=current_row, column=col)
-                        if cell.value:
-                            cell.value = f"{cell.value}\n---\n{display_text}"
-                        else:
-                            cell.value = display_text
-                        cell.fill = fill
+                for idx in slot_indices:
+                    col = idx + 3
+                    cell = ws.cell(row=current_row, column=col)
+                    cell.value = display_text
+                    cell.fill = fill
 
             current_row += 1
 
@@ -372,7 +473,7 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
         print(f"  原因: {e}")
         sys.exit(1)
 
-    return filepath
+    return filepath, all_warnings
 
 
 # ====================================================================
@@ -405,34 +506,62 @@ def main():
     timestamp_str = now.strftime("%Y%m%d_%H%M%S")
 
     # 1. フォルダ初期化
-    print("\n[1/6] フォルダ初期化...")
+    print("\n[1/7] フォルダ初期化...")
     ensure_directories()
     print("  完了")
 
     # 2. 入力ファイル探索
-    print("\n[2/6] 入力ファイル探索...")
+    print("\n[2/7] 入力ファイル探索...")
     shift_file = find_excel_in_folder("01_shift")
     care_file = find_excel_in_folder("02_care")
     master_file = find_excel_in_folder("03_master")
     used_files = [shift_file, care_file, master_file]
 
     # 3. データ読み込み
-    print("\n[3/6] データ読み込み...")
+    print("\n[3/7] データ読み込み...")
     staff_shift = load_excel(shift_file, "01_shift")
     care_plan = load_excel(care_file, "02_care")
     medical_master = load_excel(master_file, "03_master")
 
     # 4. データ結合
-    print("\n[4/6] データ結合...")
+    print("\n[4/7] データ結合...")
     merged = care_plan.merge(medical_master, on="利用者名", how="left")
-    print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件")
 
-    # 5. マトリクスExcel生成 & 色分け
-    print("\n[5/6] マトリクスExcel生成 & 色分け...")
-    output_path = build_matrix_excel(staff_shift, merged, timestamp_str)
+    # 階数・部屋番号が無い場合に備えてデフォルト値を補填
+    if "階数" not in merged.columns:
+        merged["階数"] = 0
+        print("  [情報] マスタに「階数」列がないため、全件 0 で補填しました")
+    if "部屋番号" not in merged.columns:
+        merged["部屋番号"] = ""
+        print("  [情報] マスタに「部屋番号」列がないため、空文字で補填しました")
 
-    # 6. アーカイブ
-    print("\n[6/6] アーカイブ処理...")
+    # ソート: 階数 (昇順) > 部屋番号 (昇順) > 固定時間指定 (昇順)
+    merged["_sort_floor"] = merged["階数"].apply(lambda v: safe_int(v, 0))
+    merged["_sort_room"] = merged["部屋番号"].apply(lambda v: safe_str(v, ""))
+    merged["_sort_time"] = merged["固定時間指定"].apply(
+        lambda v: safe_str(v, "99:99")
+    )
+    merged = merged.sort_values(
+        ["_sort_floor", "_sort_room", "_sort_time"]
+    ).drop(columns=["_sort_floor", "_sort_room", "_sort_time"])
+
+    print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件 (階数→部屋→時間でソート済)")
+
+    # 5. 割り当て & Excel生成
+    print("\n[5/7] Greedy割り当て & マトリクスExcel生成...")
+    output_path, warnings = build_matrix_excel(staff_shift, merged, timestamp_str)
+
+    # 6. 割り当て結果サマリ
+    print("\n[6/7] 割り当て結果...")
+    if warnings:
+        print(f"  割り当て不能タスク: {len(warnings)} 件")
+        for w in warnings:
+            print(w)
+    else:
+        print("  全タスクを正常に割り当てました")
+
+    # 7. アーカイブ
+    print("\n[7/7] アーカイブ処理...")
     archive_files(used_files, timestamp_str)
 
     print("\n" + "=" * 60)
