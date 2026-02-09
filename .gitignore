@@ -1,8 +1,12 @@
 # 出力ファイル
 02_output/*.xlsx
 
-# アーカイブ済みCSV
+# アーカイブ済みファイル
 99_archive/*.csv
+99_archive/*.xlsx
+
+# 入力Excel (利用者が配置するファイル)
+01_input/**/*.xlsx
 
 # Python
 __pycache__/

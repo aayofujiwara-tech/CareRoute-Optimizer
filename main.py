@@ -1,10 +1,12 @@
 """
 訪問看護・介護スケジュール自動生成システム - CareRoute Optimizer
 
-横軸に時間(30分刻み)、縦軸にスタッフを配置した
+Excel形式の入力ファイルをフォルダ監視型で読み込み、
+横軸に時間(30分刻み)・縦軸にスタッフを配置した
 ガントチャート風マトリクス形式のExcelを出力する。
 """
 
+import glob
 import os
 import shutil
 import sys
@@ -15,21 +17,41 @@ from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-# --- 定数 ---
+# ====================================================================
+# 定数
+# ====================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, "01_input")
+SHIFT_DIR = os.path.join(INPUT_DIR, "01_shift")
+CARE_DIR = os.path.join(INPUT_DIR, "02_care")
+MASTER_DIR = os.path.join(INPUT_DIR, "03_master")
 OUTPUT_DIR = os.path.join(BASE_DIR, "02_output")
 ARCHIVE_DIR = os.path.join(BASE_DIR, "99_archive")
 
-REQUIRED_FILES = ["staff_shift.csv", "care_plan.csv", "medical_master.csv"]
+ALL_DIRS = [SHIFT_DIR, CARE_DIR, MASTER_DIR, OUTPUT_DIR, ARCHIVE_DIR]
 
-REQUIRED_COLUMNS = {
-    "staff_shift.csv": ["日付", "スタッフ名", "開始時間", "終了時間", "NG時間帯"],
-    "care_plan.csv": ["利用者名", "曜日", "頻度", "固定時間指定", "所要時間", "サービス種類"],
-    "medical_master.csv": ["利用者名", "住所", "判定_医療", "判定_介護", "判定_障がい"],
+# 各フォルダの表示名と必須カラム
+FOLDER_CONFIG = {
+    "01_shift": {
+        "path": SHIFT_DIR,
+        "label": "シフト情報",
+        "required_columns": ["日付", "スタッフ名", "開始時間", "終了時間", "NG時間帯"],
+    },
+    "02_care": {
+        "path": CARE_DIR,
+        "label": "ケアプラン",
+        "required_columns": [
+            "利用者名", "曜日", "頻度", "固定時間指定", "所要時間", "サービス種類",
+        ],
+    },
+    "03_master": {
+        "path": MASTER_DIR,
+        "label": "利用者マスタ",
+        "required_columns": ["利用者名", "住所", "判定_医療", "判定_介護", "判定_障がい"],
+    },
 }
 
-# 時間軸: 09:00 - 18:00 (30分刻み, 19スロット)
+# 時間軸: 09:00 - 18:00 (30分刻み)
 TIME_SLOTS = []
 _t = datetime(2000, 1, 1, 9, 0)
 while _t <= datetime(2000, 1, 1, 18, 0):
@@ -56,59 +78,89 @@ ALIGN_CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
 # ====================================================================
-# ユーティリティ関数
+# フォルダ初期化・ファイル探索
 # ====================================================================
 
 def ensure_directories():
     """必要なフォルダが存在しない場合は作成する。"""
-    for d in [INPUT_DIR, OUTPUT_DIR, ARCHIVE_DIR]:
+    for d in ALL_DIRS:
         os.makedirs(d, exist_ok=True)
 
 
-def check_input_files():
-    """入力フォルダ内に必要な3つのCSVが揃っているか確認する。"""
-    missing = [f for f in REQUIRED_FILES if not os.path.isfile(os.path.join(INPUT_DIR, f))]
-    if missing:
-        print(f"エラー: 以下の入力ファイルが見つかりません: {', '.join(missing)}")
-        print(f"  入力フォルダ: {INPUT_DIR}")
+def find_excel_in_folder(folder_key):
+    """指定フォルダ内の .xlsx ファイルを探索し、パスを1つ返す。
+
+    - ファイルが0個 → エラー終了
+    - ファイルが1個 → そのまま返す
+    - ファイルが複数 → 更新日時が最新のものを警告付きで返す
+    """
+    config = FOLDER_CONFIG[folder_key]
+    folder_path = config["path"]
+    label = config["label"]
+    folder_name = folder_key
+
+    xlsx_files = sorted(glob.glob(os.path.join(folder_path, "*.xlsx")))
+    # 一時ファイル (~$...) を除外
+    xlsx_files = [f for f in xlsx_files if not os.path.basename(f).startswith("~$")]
+
+    if not xlsx_files:
+        print(f"[エラー] {folder_name}フォルダにExcelファイルが見つかりません")
+        print(f"  対象フォルダ: {folder_path}")
         sys.exit(1)
 
+    if len(xlsx_files) == 1:
+        chosen = xlsx_files[0]
+        print(f"  {label}: {os.path.basename(chosen)}")
+        return chosen
 
-def load_csv(filename, description):
-    """CSVファイルを読み込み、DataFrameとして返す。"""
-    filepath = os.path.join(INPUT_DIR, filename)
+    # 複数ファイルがある場合 → 更新日時が最新のものを選択
+    xlsx_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    chosen = xlsx_files[0]
+    print(f"  [警告] {folder_name}フォルダに複数のExcelファイルがあります ({len(xlsx_files)}件)")
+    for f in xlsx_files:
+        mtime = datetime.fromtimestamp(os.path.getmtime(f)).strftime("%Y-%m-%d %H:%M:%S")
+        marker = " ← 採用" if f == chosen else ""
+        print(f"    - {os.path.basename(f)} (更新: {mtime}){marker}")
+    return chosen
+
+
+def load_excel(filepath, folder_key):
+    """Excelファイルの1シート目を読み込み、カラム検証して DataFrame を返す。"""
+    config = FOLDER_CONFIG[folder_key]
+    label = config["label"]
+    filename = os.path.basename(filepath)
+
     try:
-        df = pd.read_csv(filepath, encoding="utf-8-sig")
-    except UnicodeDecodeError:
-        try:
-            df = pd.read_csv(filepath, encoding="cp932")
-            print(f"  {description} ({filename}): {len(df)} 件読み込み (cp932)")
-        except Exception as e:
-            print(f"エラー: {description} ({filename}) の読み込みに失敗しました。")
-            print(f"  原因: {e}")
-            sys.exit(1)
+        df = pd.read_excel(filepath, sheet_name=0, engine="openpyxl")
     except Exception as e:
-        print(f"エラー: {description} ({filename}) の読み込みに失敗しました。")
+        print(f"[エラー] {label} ({filename}) の読み込みに失敗しました。")
+        print(f"  ファイルが破損しているか、Excel形式ではない可能性があります。")
         print(f"  原因: {e}")
         sys.exit(1)
-    else:
-        print(f"  {description} ({filename}): {len(df)} 件読み込み")
 
-    # 必要な列の存在チェック
-    required = REQUIRED_COLUMNS[filename]
-    missing_cols = [c for c in required if c not in df.columns]
-    if missing_cols:
-        print(f"エラー: {filename} に必要な列が不足しています: {', '.join(missing_cols)}")
-        print(f"  存在する列: {', '.join(df.columns)}")
+    # 必須カラムの存在チェック
+    required = config["required_columns"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        print(f"[エラー] {label} ({filename}) に必要な列が不足しています。")
+        print(f"  不足列: {', '.join(missing)}")
+        print(f"  存在する列: {', '.join(df.columns.tolist())}")
         sys.exit(1)
 
+    print(f"  {label} ({filename}): {len(df)} 件読み込み")
     return df
 
 
+# ====================================================================
+# データ変換ユーティリティ
+# ====================================================================
+
 def normalize_boolean(value):
-    """TRUE/FALSE 文字列やブール値を Python bool に変換する。"""
+    """TRUE/FALSE 文字列・ブール値・1/0 を Python bool に変換する。"""
     if isinstance(value, bool):
         return value
+    if isinstance(value, (int, float)):
+        return value == 1
     if isinstance(value, str):
         return value.strip().upper() == "TRUE"
     return False
@@ -128,14 +180,21 @@ def parse_time(time_str):
     if pd.isna(time_str) or str(time_str).strip() == "":
         return None
     s = str(time_str).strip()
+    # datetime オブジェクトがそのまま入っている場合に対応
+    if hasattr(time_str, "hour"):
+        return time_str if hasattr(time_str, "second") else None
     try:
         return datetime.strptime(s, "%H:%M").time()
     except ValueError:
-        return None
+        # "09:00:00" のような秒付きフォーマットにも対応
+        try:
+            return datetime.strptime(s, "%H:%M:%S").time()
+        except ValueError:
+            return None
 
 
 def time_to_slot_index(time_str):
-    """時間文字列 (HH:MM) を TIME_SLOTS 内のインデックスに変換する。"""
+    """時間文字列を TIME_SLOTS 内のインデックスに変換する。"""
     t = parse_time(time_str)
     if t is None:
         return None
@@ -175,7 +234,7 @@ def is_within_shift(slot_label, shift_start_str, shift_end_str):
 
 
 # ====================================================================
-# Excel生成
+# Excel生成 (マトリクスレイアウト)
 # ====================================================================
 
 def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
@@ -193,11 +252,7 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
         cell.border = THIN_BORDER
         cell.alignment = ALIGN_CENTER
 
-    # --- 日付ごとにスタッフ行を作成 ---
-    # 日付ごとのグループ化
-    dates = staff_shift_df["日付"].unique()
-
-    # care_plan を曜日別に整理 (固定時間指定ありのもの)
+    # --- ケアプランを曜日別に整理 ---
     tasks_by_weekday = {}
     for _, task_row in merged_df.iterrows():
         weekday = str(task_row["曜日"]).strip()
@@ -205,18 +260,21 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             tasks_by_weekday[weekday] = []
         tasks_by_weekday[weekday].append(task_row)
 
+    # --- 日付ごと・スタッフごとに行を生成 ---
+    dates = staff_shift_df["日付"].unique()
     current_row = 2
 
-    for date_str in sorted(dates):
+    for date_val in sorted(dates):
         # 日付から曜日を取得
         try:
-            date_obj = pd.to_datetime(date_str)
+            date_obj = pd.to_datetime(date_val)
             weekday_jp = WEEKDAY_JP[date_obj.weekday()]
+            date_display = date_obj.strftime("%Y-%m-%d")
         except Exception:
             weekday_jp = None
+            date_display = str(date_val)
 
-        # この日に出勤しているスタッフ一覧
-        day_staff = staff_shift_df[staff_shift_df["日付"] == date_str]
+        day_staff = staff_shift_df[staff_shift_df["日付"] == date_val]
 
         for _, staff_row in day_staff.iterrows():
             staff_name = staff_row["スタッフ名"]
@@ -225,7 +283,7 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             ng_range = staff_row["NG時間帯"]
 
             # A列: 日付, B列: スタッフ名
-            date_cell = ws.cell(row=current_row, column=1, value=date_str)
+            date_cell = ws.cell(row=current_row, column=1, value=date_display)
             date_cell.border = THIN_BORDER
             date_cell.font = FONT_CELL
             date_cell.alignment = ALIGN_CENTER
@@ -236,8 +294,8 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             name_cell.alignment = ALIGN_CENTER
 
             # 各タイムスロットのセルを初期化 (罫線のみ)
-            for slot_idx, slot_label in enumerate(TIME_SLOTS):
-                col = slot_idx + 3  # C列から
+            for slot_idx in range(len(TIME_SLOTS)):
+                col = slot_idx + 3
                 cell = ws.cell(row=current_row, column=col)
                 cell.border = THIN_BORDER
                 cell.font = FONT_CELL
@@ -258,20 +316,19 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
                         duration_min = 30
                     slot_count = max(1, duration_min // 30)
 
-                    # シフト時間内か・NG時間帯でないかチェック
+                    # 開始時刻がシフト時間内か・NG時間帯でないか
                     slot_label = TIME_SLOTS[start_idx]
                     if not is_within_shift(slot_label, shift_start, shift_end):
                         continue
                     if is_in_ng_range(slot_label, ng_range):
                         continue
 
-                    # セルに書き込む表示テキスト
                     user_name = str(task_row["利用者名"])
                     service = str(task_row["サービス種類"])
                     display_text = f"{user_name}\n({service})"
                     fill = get_fill_for_user(task_row)
 
-                    # 所要時間分のスロットを塗る
+                    # 所要時間分のスロットにタスクを書き込む
                     for offset in range(slot_count):
                         idx = start_idx + offset
                         if idx >= len(TIME_SLOTS):
@@ -284,7 +341,6 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
 
                         col = idx + 3
                         cell = ws.cell(row=current_row, column=col)
-                        # 既にタスクが入っている場合は追記
                         if cell.value:
                             cell.value = f"{cell.value}\n---\n{display_text}"
                         else:
@@ -293,28 +349,26 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
 
             current_row += 1
 
-    # --- 列幅調整 ---
-    ws.column_dimensions["A"].width = 14  # 日付
-    ws.column_dimensions["B"].width = 14  # スタッフ名
+    # --- 列幅・行高さ調整 ---
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 14
     for slot_idx in range(len(TIME_SLOTS)):
         col_letter = get_column_letter(slot_idx + 3)
-        ws.column_dimensions[col_letter].width = 18  # タイムスロット
-
-    # 行の高さ調整
+        ws.column_dimensions[col_letter].width = 18
     for row_idx in range(2, current_row):
         ws.row_dimensions[row_idx].height = 50
 
     # --- 保存 ---
-    filename = f"週間スケジュール_マトリクス_{timestamp_str}.xlsx"
+    filename = f"週間スケジュール_{timestamp_str}.xlsx"
     filepath = os.path.join(OUTPUT_DIR, filename)
     try:
         wb.save(filepath)
         print(f"  出力ファイル: {filepath}")
     except PermissionError:
-        print(f"エラー: ファイルへの書き込み権限がありません: {filepath}")
+        print(f"[エラー] ファイルへの書き込み権限がありません: {filepath}")
         sys.exit(1)
     except Exception as e:
-        print(f"エラー: Excel出力に失敗しました。")
+        print(f"[エラー] Excel出力に失敗しました。")
         print(f"  原因: {e}")
         sys.exit(1)
 
@@ -325,17 +379,17 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
 # アーカイブ処理
 # ====================================================================
 
-def archive_inputs(timestamp_str):
-    """処理済みの入力ファイルをアーカイブフォルダに移動する。"""
-    for filename in REQUIRED_FILES:
-        src = os.path.join(INPUT_DIR, filename)
-        dst = os.path.join(ARCHIVE_DIR, f"{timestamp_str}_{filename}")
+def archive_files(file_paths, timestamp_str):
+    """処理に使用した入力ファイルをアーカイブフォルダへ移動する。"""
+    for src in file_paths:
+        original_name = os.path.basename(src)
+        dst = os.path.join(ARCHIVE_DIR, f"{timestamp_str}_{original_name}")
         try:
             shutil.move(src, dst)
-            print(f"  アーカイブ: {filename} -> {os.path.basename(dst)}")
+            print(f"  アーカイブ: {original_name} -> {os.path.basename(dst)}")
         except Exception as e:
-            print(f"警告: {filename} のアーカイブに失敗しました。")
-            print(f"  原因: {e}")
+            print(f"  [警告] {original_name} のアーカイブに失敗しました。")
+            print(f"    原因: {e}")
 
 
 # ====================================================================
@@ -343,43 +397,43 @@ def archive_inputs(timestamp_str):
 # ====================================================================
 
 def main():
-    """メイン処理フロー。"""
     print("=" * 60)
     print("CareRoute Optimizer - 訪問看護・介護スケジュール自動生成")
     print("=" * 60)
 
     now = datetime.now()
     timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-    date_str = now.strftime("%Y%m%d")
 
-    # 1. 初期化
+    # 1. フォルダ初期化
     print("\n[1/6] フォルダ初期化...")
     ensure_directories()
     print("  完了")
 
-    # 2. ファイル確認
-    print("\n[2/6] 入力ファイル確認...")
-    check_input_files()
-    print("  必要なファイルがすべて揃っています")
+    # 2. 入力ファイル探索
+    print("\n[2/6] 入力ファイル探索...")
+    shift_file = find_excel_in_folder("01_shift")
+    care_file = find_excel_in_folder("02_care")
+    master_file = find_excel_in_folder("03_master")
+    used_files = [shift_file, care_file, master_file]
 
     # 3. データ読み込み
     print("\n[3/6] データ読み込み...")
-    staff_shift = load_csv("staff_shift.csv", "スタッフ出勤情報")
-    care_plan = load_csv("care_plan.csv", "ケア予定")
-    medical_master = load_csv("medical_master.csv", "利用者マスタ")
+    staff_shift = load_excel(shift_file, "01_shift")
+    care_plan = load_excel(care_file, "02_care")
+    medical_master = load_excel(master_file, "03_master")
 
     # 4. データ結合
     print("\n[4/6] データ結合...")
     merged = care_plan.merge(medical_master, on="利用者名", how="left")
-    print(f"  結合後レコード数: {len(merged)} 件")
+    print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件")
 
-    # 5. Excel生成 (マトリクス形式) & 6. 色分け処理
+    # 5. マトリクスExcel生成 & 色分け
     print("\n[5/6] マトリクスExcel生成 & 色分け...")
-    output_path = build_matrix_excel(staff_shift, merged, date_str)
+    output_path = build_matrix_excel(staff_shift, merged, timestamp_str)
 
-    # 7. アーカイブ処理
+    # 6. アーカイブ
     print("\n[6/6] アーカイブ処理...")
-    archive_inputs(timestamp_str)
+    archive_files(used_files, timestamp_str)
 
     print("\n" + "=" * 60)
     print("処理が正常に完了しました。")
