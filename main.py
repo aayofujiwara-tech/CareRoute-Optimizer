@@ -259,17 +259,32 @@ def is_within_shift(slot_label, shift_start_str, shift_end_str):
 # Greedy 割り当てロジック
 # ====================================================================
 
-def is_movement_allowed(prev_building, curr_building):
-    """建物間の移動が許可されるか判定する。
+def is_c_building(building_name):
+    """建物名がC棟（隔離棟）か判定する。
 
-    C棟は隔離棟のため、他の棟との行き来は不可。
-    C棟 → C棟 のみ許可。他の棟同士 (A↔B等) は許可。
+    「C棟」「C棟（離れ）」「C棟(別館)」等の表記揺れに対応するため、
+    部分一致で判定する。
     """
-    if not prev_building or not curr_building:
-        return True
-    if prev_building == curr_building:
-        return True
-    if prev_building == "C棟" or curr_building == "C棟":
+    if not building_name:
+        return False
+    return "C棟" in str(building_name)
+
+
+def is_isolation_ok(staff_name, task_building, visited_c, visited_non_c):
+    """C棟隔離ルールに基づき、スタッフがこの建物に行けるか判定する。
+
+    ルール:
+      - C棟に一度でも行ったスタッフ → その日はC棟以外に行けない
+      - C棟以外に一度でも行ったスタッフ → その日はC棟に行けない
+      - まだどこにも行っていない (朝イチ) → どこでもOK
+    """
+    task_is_c = is_c_building(task_building)
+
+    if staff_name in visited_c and not task_is_c:
+        # C棟に行った人が非C棟タスクに行こうとしている → NG
+        return False
+    if staff_name in visited_non_c and task_is_c:
+        # 非C棟に行った人がC棟タスクに行こうとしている → NG
         return False
     return True
 
@@ -340,6 +355,11 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
     staff_last_floor = {name: None for name in staff_info}
     staff_last_building = {name: None for name in staff_info}
 
+    # C棟隔離の履歴管理 (日ごと)
+    # 一度でもC棟に行ったスタッフ / 一度でも非C棟に行ったスタッフ
+    visited_c = set()
+    visited_non_c = set()
+
     assignments = {name: [] for name in staff_info}
     day_stats = {name: {"count": 0, "total_rank": 0} for name in staff_info}
 
@@ -383,8 +403,8 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
             if info["occupied_slots"] & set(needed_slots):
                 continue
 
-            # C棟隔離チェック: 前回の建物からの移動が許可されるか
-            if not is_movement_allowed(staff_last_building[staff_name], task_building):
+            # C棟隔離チェック: 訪問履歴ベースで判定
+            if not is_isolation_ok(staff_name, task_building, visited_c, visited_non_c):
                 continue
 
             candidates.append(staff_name)
@@ -412,10 +432,28 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
         staff_info[best]["occupied_slots"].update(needed_slots)
         staff_last_floor[best] = task_floor
         staff_last_building[best] = task_building
+
+        # C棟隔離の履歴更新
+        if task_building:
+            if is_c_building(task_building):
+                visited_c.add(best)
+            else:
+                visited_non_c.add(best)
+
         carry_over[best]["cumulative_rank"] += task_rank
         day_stats[best]["count"] += 1
         day_stats[best]["total_rank"] += task_rank
         assignments[best].append((needed_slots, task_row))
+
+    # デバッグ: C棟隔離状態をログ出力
+    if visited_c:
+        c_staff = ", ".join(sorted(visited_c))
+        print(f"    [隔離ログ] {date_display}: C棟担当 → {c_staff}")
+        # 違反チェック
+        violation = visited_c & visited_non_c
+        if violation:
+            v_staff = ", ".join(sorted(violation))
+            print(f"    [隔離違反!] {date_display}: {v_staff} がC棟と他棟の両方に割り当てられています")
 
     return assignments, warnings, day_stats, carry_over
 
