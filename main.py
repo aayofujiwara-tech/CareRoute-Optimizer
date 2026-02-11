@@ -12,7 +12,7 @@ Excel形式の入力ファイルをフォルダ監視型で読み込み、
   - 同一建物: -30pt (ボーナス)
   - 同一建物かつ同一階: さらに -20pt
   - 同一建物で異なる階: 階差 × 5pt (ペナルティ)
-  - 異なる建物間 (A↔B等): +20pt (ペナルティ)
+  - 異なる建物間 (A↔B等): +50pt (ペナルティ)
 """
 
 import glob
@@ -297,7 +297,7 @@ def calculate_movement_score(task_floor, task_building, last_floor, last_buildin
     - 同一建物: -30pt
       - さらに同一階: -20pt (合計 -50pt)
       - 異なる階: +階差×5pt
-    - 異なる建物: +20pt
+    - 異なる建物: +50pt
     """
     if last_building is None and last_floor is None:
         return 0
@@ -313,7 +313,7 @@ def calculate_movement_score(task_floor, task_building, last_floor, last_buildin
         return score
     else:
         # 異なる建物ペナルティ
-        return 20
+        return 50
 
 
 def _is_slot_range_available(needed_slots, staff_name, staff_info):
