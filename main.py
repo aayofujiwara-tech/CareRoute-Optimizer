@@ -3,8 +3,8 @@
 (Multi-Building Edition)
 
 Excel形式の入力ファイルをフォルダ監視型で読み込み、
-スコアリング方式（負荷平準化 + 建物間動線最適化）で
-1タスク=1スタッフの割り当てを行い、
+2段階方式（固定タスク → フリータスク自動配置）の
+スコアリング割り当て（負荷平準化 + 建物間動線最適化）を行い、
 ガントチャート風マトリクス形式のExcelを出力する。
 
 建物間ルール:
@@ -316,22 +316,57 @@ def calculate_movement_score(task_floor, task_building, last_floor, last_buildin
         return 20
 
 
-def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
-    """1日分のタスクをスコアリング方式で割り当てる。
+def _is_slot_range_available(needed_slots, staff_name, staff_info):
+    """指定スロット範囲がスタッフにとって利用可能か判定する。
 
-    Score = (累積ランク合計 * 10) - 動線ボーナス
-    スコアが低いスタッフが優先的に選ばれる。
-    累積ランクは日をまたいで引き継ぎ、負荷を全日程で平準化する。
+    勤務時間内 / NG時間帯でない / 空きスロット の全条件を満たす場合 True。
+    """
+    info = staff_info[staff_name]
+    for idx in needed_slots:
+        slot_label = TIME_SLOTS[idx]
+        if not is_within_shift(slot_label, info["shift_start"], info["shift_end"]):
+            return False
+        if is_in_ng_range(slot_label, info["ng_range"]):
+            return False
+    if info["occupied_slots"] & set(needed_slots):
+        return False
+    return True
 
-    Args:
-        carry_over: dict[staff_name] -> {"cumulative_rank": int, ...}
-            前日までの累積状態。この日の出勤者のみ使用する。
 
-    Returns:
-        assignments: dict[staff_name] -> list of (slot_indices, task_row)
-        warnings: list of str
-        day_stats: dict[staff_name] -> {"count": int, "total_rank": int}
-        carry_over: 更新済みの累積状態
+def _do_assign(best, needed_slots, task_row, staff_info, staff_last_floor,
+               staff_last_building, visited_c, visited_non_c,
+               carry_over, day_stats, assignments):
+    """タスクをスタッフに割り当て、各種状態を更新する共通処理。"""
+    task_floor = safe_int(task_row.get("階数", None), default=0)
+    task_building = safe_str(task_row.get("建物名", None), default="")
+    task_rank = safe_int(task_row.get("ランク", None), default=1)
+
+    staff_info[best]["occupied_slots"].update(needed_slots)
+    staff_last_floor[best] = task_floor
+    staff_last_building[best] = task_building
+
+    if task_building:
+        if is_c_building(task_building):
+            visited_c.add(best)
+        else:
+            visited_non_c.add(best)
+
+    carry_over[best]["cumulative_rank"] += task_rank
+    day_stats[best]["count"] += 1
+    day_stats[best]["total_rank"] += task_rank
+    assignments[best].append((needed_slots, task_row))
+
+
+def assign_tasks_for_date(day_staff_df, day_tasks_fixed, day_tasks_free,
+                          date_display, carry_over):
+    """1日分のタスクを2段階方式で割り当てる。
+
+    フェーズ1 (固定タスク): 固定時間指定ありのタスクを時間順に処理。
+    フェーズ2 (フリータスク): 固定時間指定なしのタスクを、
+        全スタッフ×全空きスロットから最適な場所を探索して自動配置。
+
+    累積ランクは日をまたいで引き継ぎ (carry_over)、
+    C棟隔離履歴は日ごとにリセットされる。
     """
     warnings = []
 
@@ -356,15 +391,16 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
     staff_last_building = {name: None for name in staff_info}
 
     # C棟隔離の履歴管理 (日ごと)
-    # 一度でもC棟に行ったスタッフ / 一度でも非C棟に行ったスタッフ
     visited_c = set()
     visited_non_c = set()
 
     assignments = {name: [] for name in staff_info}
     day_stats = {name: {"count": 0, "total_rank": 0} for name in staff_info}
 
-    # タスクを順に処理
-    for _, task_row in day_tasks.iterrows():
+    # ================================================================
+    # フェーズ1: 固定タスクの割り当て (従来ロジック)
+    # ================================================================
+    for _, task_row in day_tasks_fixed.iterrows():
         fixed_time = str(task_row["固定時間指定"]).strip()
         start_idx = time_to_slot_index(fixed_time)
         if start_idx is None:
@@ -375,7 +411,6 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
         except (ValueError, TypeError):
             duration_min = 30
         slot_count = max(1, duration_min // 30)
-
         needed_slots = list(range(start_idx, min(start_idx + slot_count, len(TIME_SLOTS))))
 
         user_name = safe_str(task_row["利用者名"])
@@ -383,30 +418,12 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
         task_building = safe_str(task_row.get("建物名", None), default="")
         task_rank = safe_int(task_row.get("ランク", None), default=1)
 
-        # 候補スタッフをリストアップ
         candidates = []
-        for staff_name, info in staff_info.items():
-            all_in_shift = all(
-                is_within_shift(TIME_SLOTS[idx], info["shift_start"], info["shift_end"])
-                for idx in needed_slots
-            )
-            if not all_in_shift:
+        for staff_name in staff_info:
+            if not _is_slot_range_available(needed_slots, staff_name, staff_info):
                 continue
-
-            any_ng = any(
-                is_in_ng_range(TIME_SLOTS[idx], info["ng_range"])
-                for idx in needed_slots
-            )
-            if any_ng:
-                continue
-
-            if info["occupied_slots"] & set(needed_slots):
-                continue
-
-            # C棟隔離チェック: 訪問履歴ベースで判定
             if not is_isolation_ok(staff_name, task_building, visited_c, visited_non_c):
                 continue
-
             candidates.append(staff_name)
 
         if not candidates:
@@ -416,8 +433,6 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
             warnings.append(msg)
             continue
 
-        # スコアリングで最適スタッフを選択
-        # Score = 累積ランク*10 + 動線スコア + ランダムジッター(0-5)
         def calc_score(name):
             movement = calculate_movement_score(
                 task_floor, task_building,
@@ -427,29 +442,71 @@ def assign_tasks_for_date(day_staff_df, day_tasks, date_display, carry_over):
             return (carry_over[name]["cumulative_rank"] * 10) + movement + jitter
 
         best = min(candidates, key=calc_score)
+        _do_assign(best, needed_slots, task_row, staff_info,
+                   staff_last_floor, staff_last_building,
+                   visited_c, visited_non_c,
+                   carry_over, day_stats, assignments)
 
-        # 割り当て実行
-        staff_info[best]["occupied_slots"].update(needed_slots)
-        staff_last_floor[best] = task_floor
-        staff_last_building[best] = task_building
+    # ================================================================
+    # フェーズ2: フリータスクの自動配置
+    # 全スタッフ × 全空きスロットから最適な (スタッフ, 開始時間) を探索
+    # ================================================================
+    for _, task_row in day_tasks_free.iterrows():
+        try:
+            duration_min = int(task_row["所要時間"])
+        except (ValueError, TypeError):
+            duration_min = 30
+        slot_count = max(1, duration_min // 30)
 
-        # C棟隔離の履歴更新
-        if task_building:
-            if is_c_building(task_building):
-                visited_c.add(best)
-            else:
-                visited_non_c.add(best)
+        user_name = safe_str(task_row["利用者名"])
+        task_floor = safe_int(task_row.get("階数", None), default=0)
+        task_building = safe_str(task_row.get("建物名", None), default="")
+        task_rank = safe_int(task_row.get("ランク", None), default=1)
 
-        carry_over[best]["cumulative_rank"] += task_rank
-        day_stats[best]["count"] += 1
-        day_stats[best]["total_rank"] += task_rank
-        assignments[best].append((needed_slots, task_row))
+        # 全候補 (スタッフ, 開始スロット) を列挙してスコアリング
+        best_candidate = None
+        best_score = float("inf")
+
+        for staff_name in staff_info:
+            if not is_isolation_ok(staff_name, task_building, visited_c, visited_non_c):
+                continue
+
+            # このスタッフで配置可能な全開始スロットを探索
+            max_start = len(TIME_SLOTS) - slot_count + 1
+            for start_idx in range(max_start):
+                needed_slots = list(range(start_idx, start_idx + slot_count))
+                if not _is_slot_range_available(needed_slots, staff_name, staff_info):
+                    continue
+
+                # スコア計算: 負荷 + 動線 + ジッター
+                movement = calculate_movement_score(
+                    task_floor, task_building,
+                    staff_last_floor[staff_name],
+                    staff_last_building[staff_name],
+                )
+                jitter = random.uniform(0, 5)
+                score = (carry_over[staff_name]["cumulative_rank"] * 10) + movement + jitter
+
+                if score < best_score:
+                    best_score = score
+                    best_candidate = (staff_name, needed_slots)
+
+        if best_candidate is None:
+            bldg_info = f" ({task_building})" if task_building else ""
+            msg = f"  [警告] {date_display} フリータスク {user_name}様{bldg_info}を配置できる空きがありません"
+            warnings.append(msg)
+            continue
+
+        best_staff, best_slots = best_candidate
+        _do_assign(best_staff, best_slots, task_row, staff_info,
+                   staff_last_floor, staff_last_building,
+                   visited_c, visited_non_c,
+                   carry_over, day_stats, assignments)
 
     # デバッグ: C棟隔離状態をログ出力
     if visited_c:
         c_staff = ", ".join(sorted(visited_c))
         print(f"    [隔離ログ] {date_display}: C棟担当 → {c_staff}")
-        # 違反チェック
         violation = visited_c & visited_non_c
         if violation:
             v_staff = ", ".join(sorted(violation))
@@ -485,13 +542,18 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
     global_stats = {}
     carry_over = {}  # 日をまたいで累積ランクを引き継ぐ
 
-    # ケアプランを曜日別に整理
-    tasks_by_weekday = {}
+    # ケアプランを曜日別に整理 (固定/フリー分離)
+    fixed_by_weekday = {}
+    free_by_weekday = {}
     for _, task_row in merged_df.iterrows():
         weekday = str(task_row["曜日"]).strip()
-        if weekday not in tasks_by_weekday:
-            tasks_by_weekday[weekday] = []
-        tasks_by_weekday[weekday].append(task_row)
+        fixed_time = task_row.get("固定時間指定", None)
+        is_free = pd.isna(fixed_time) or str(fixed_time).strip() == ""
+
+        if is_free:
+            free_by_weekday.setdefault(weekday, []).append(task_row)
+        else:
+            fixed_by_weekday.setdefault(weekday, []).append(task_row)
 
     for date_val in sorted(dates):
         try:
@@ -504,17 +566,21 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
 
         day_staff_df = staff_shift_df[staff_shift_df["日付"] == date_val]
 
-        # この曜日のタスクを取得してソート済みDataFrameにする
-        day_task_list = tasks_by_weekday.get(weekday_jp, [])
-        if day_task_list:
-            day_tasks_df = pd.DataFrame(day_task_list)
-        else:
-            day_tasks_df = pd.DataFrame()
+        # この曜日の固定/フリータスクを取得
+        fixed_list = fixed_by_weekday.get(weekday_jp, [])
+        free_list = free_by_weekday.get(weekday_jp, [])
+        day_fixed_df = pd.DataFrame(fixed_list) if fixed_list else pd.DataFrame()
+        day_free_df = pd.DataFrame(free_list) if free_list else pd.DataFrame()
 
-        # スコアリング割り当て実行
-        if not day_tasks_df.empty:
+        # 2段階割り当て実行
+        has_tasks = not day_fixed_df.empty or not day_free_df.empty
+        if has_tasks:
+            if day_fixed_df.empty:
+                day_fixed_df = pd.DataFrame()
+            if day_free_df.empty:
+                day_free_df = pd.DataFrame()
             assignments, warnings, day_stats, carry_over = assign_tasks_for_date(
-                day_staff_df, day_tasks_df, date_display, carry_over
+                day_staff_df, day_fixed_df, day_free_df, date_display, carry_over
             )
             all_warnings.extend(warnings)
             for name, stats in day_stats.items():
@@ -672,8 +738,13 @@ def main():
         merged["ランク"] = 1
         print("  [情報] ケアプランに「ランク」列がないため、全件 1 で補填しました")
 
-    # ソート: 固定時間指定 (昇順) > 建物名 (昇順) > 階数 (昇順)
-    # 時間順で処理することで、スタッフが同一建物・同一階に留まりやすくなる
+    # 固定タスク / フリータスクの件数を集計
+    def _is_free(v):
+        return pd.isna(v) or str(v).strip() == ""
+    n_fixed = sum(1 for v in merged["固定時間指定"] if not _is_free(v))
+    n_free = len(merged) - n_fixed
+
+    # ソート: 固定時間指定 (昇順, 空欄は末尾) > 建物名 (昇順) > 階数 (昇順)
     merged["_sort_time"] = merged["固定時間指定"].apply(
         lambda v: safe_str(v, "99:99")
     )
@@ -683,7 +754,7 @@ def main():
         ["_sort_time", "_sort_building", "_sort_floor"]
     ).drop(columns=["_sort_time", "_sort_building", "_sort_floor"])
 
-    print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件 (時間→建物→階数でソート済)")
+    print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件 (固定: {n_fixed}件, フリー: {n_free}件)")
 
     # 5. 割り当て & Excel生成
     print("\n[5/7] スコアリング割り当て & マトリクスExcel生成...")
