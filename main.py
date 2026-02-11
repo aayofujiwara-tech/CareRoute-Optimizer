@@ -12,7 +12,7 @@ Excel形式の入力ファイルをフォルダ監視型で読み込み、
   - 同一建物: -30pt (ボーナス)
   - 同一建物かつ同一階: さらに -20pt
   - 同一建物で異なる階: 階差 × 5pt (ペナルティ)
-  - 異なる建物間 (A↔B等): +50pt (ペナルティ)
+  - 異なる建物間 (A↔B等): +30pt (基礎) + 当日移動回数×40pt (累積)
 """
 
 import glob
@@ -297,7 +297,7 @@ def calculate_movement_score(task_floor, task_building, last_floor, last_buildin
     - 同一建物: -30pt
       - さらに同一階: -20pt (合計 -50pt)
       - 異なる階: +階差×5pt
-    - 異なる建物: +50pt
+    - 異なる建物: +30pt
     """
     if last_building is None and last_floor is None:
         return 0
@@ -312,8 +312,8 @@ def calculate_movement_score(task_floor, task_building, last_floor, last_buildin
                 score += abs(task_floor - last_floor) * 5  # 階差ペナルティ
         return score
     else:
-        # 異なる建物ペナルティ
-        return 50
+        # 異なる建物ペナルティ (基礎分。累積移動ペナルティは呼び出し側で加算)
+        return 30
 
 
 def _is_slot_range_available(needed_slots, staff_name, staff_info):
@@ -340,6 +340,11 @@ def _do_assign(best, needed_slots, task_row, staff_info, staff_last_floor,
     task_floor = safe_int(task_row.get("階数", None), default=0)
     task_building = safe_str(task_row.get("建物名", None), default="")
     task_rank = safe_int(task_row.get("ランク", None), default=1)
+
+    # 建物移動カウント: 前回の建物から変わった場合にカウントアップ
+    last_bldg = staff_last_building[best]
+    if last_bldg is not None and task_building and last_bldg != task_building:
+        day_stats[best]["move_count"] = day_stats[best].get("move_count", 0) + 1
 
     staff_info[best]["occupied_slots"].update(needed_slots)
     staff_last_floor[best] = task_floor
@@ -438,8 +443,9 @@ def assign_tasks_for_date(day_staff_df, day_tasks_fixed, day_tasks_free,
                 task_floor, task_building,
                 staff_last_floor[name], staff_last_building[name],
             )
+            move_penalty = day_stats[name].get("move_count", 0) * 40
             jitter = random.uniform(0, 5)
-            return (carry_over[name]["cumulative_rank"] * 10) + movement + jitter
+            return (carry_over[name]["cumulative_rank"] * 10) + movement + move_penalty + jitter
 
         best = min(candidates, key=calc_score)
         _do_assign(best, needed_slots, task_row, staff_info,
@@ -478,14 +484,15 @@ def assign_tasks_for_date(day_staff_df, day_tasks_fixed, day_tasks_free,
                 if not _is_slot_range_available(needed_slots, staff_name, staff_info):
                     continue
 
-                # スコア計算: 負荷 + 動線 + ジッター
+                # スコア計算: 負荷 + 動線 + 累積移動ペナルティ + ジッター
                 movement = calculate_movement_score(
                     task_floor, task_building,
                     staff_last_floor[staff_name],
                     staff_last_building[staff_name],
                 )
+                move_penalty = day_stats[staff_name].get("move_count", 0) * 40
                 jitter = random.uniform(0, 5)
-                score = (carry_over[staff_name]["cumulative_rank"] * 10) + movement + jitter
+                score = (carry_over[staff_name]["cumulative_rank"] * 10) + movement + move_penalty + jitter
 
                 if score < best_score:
                     best_score = score
