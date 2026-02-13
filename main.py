@@ -18,6 +18,7 @@ Excel形式の入力ファイルをフォルダ監視型で読み込み、
 import glob
 import os
 import random
+import re
 import shutil
 import sys
 from datetime import datetime, timedelta
@@ -32,13 +33,22 @@ from openpyxl.utils import get_column_letter
 # ====================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_DIR = os.path.join(BASE_DIR, "01_input")
+INTEGRATED_DIR = os.path.join(INPUT_DIR, "00_integrated")
 SHIFT_DIR = os.path.join(INPUT_DIR, "01_shift")
 CARE_DIR = os.path.join(INPUT_DIR, "02_care")
 MASTER_DIR = os.path.join(INPUT_DIR, "03_master")
 OUTPUT_DIR = os.path.join(BASE_DIR, "02_output")
 ARCHIVE_DIR = os.path.join(BASE_DIR, "99_archive")
 
-ALL_DIRS = [SHIFT_DIR, CARE_DIR, MASTER_DIR, OUTPUT_DIR, ARCHIVE_DIR]
+ALL_DIRS = [INTEGRATED_DIR, SHIFT_DIR, CARE_DIR, MASTER_DIR, OUTPUT_DIR, ARCHIVE_DIR]
+
+# 曜日名の正規化マッピング
+WEEKDAY_NAMES = ["月", "火", "水", "木", "金", "土", "日"]
+
+# デフォルトシフト設定
+DEFAULT_SHIFT_START = "09:00"
+DEFAULT_SHIFT_END = "18:00"
+DEFAULT_SHIFT_NG = "12:00-13:00"
 
 # 各フォルダの表示名と必須カラム
 FOLDER_CONFIG = {
@@ -256,6 +266,329 @@ def is_within_shift(slot_label, shift_start_str, shift_end_str):
 
 
 # ====================================================================
+# 統合入力パーサー
+# ====================================================================
+
+def parse_visit_schedule(visit_str):
+    """訪問日の自然言語記述をパースし、構造化データのリストを返す。
+
+    入力例:
+      "週3回(月水金)\n1回30分"
+      "週7回\n1日3回\n1回30分"
+      "週3回(月水金)\n月金は60分\n水は30分"
+      "週1回(木)\n1回30分\n9:30〜"
+      "週3回(月水金)\n1回30分\n午後"
+
+    返り値: list of dict
+      [{"weekday": "月", "duration": 30, "fixed_time": None, "afternoon": False}, ...]
+    """
+    if pd.isna(visit_str) or str(visit_str).strip() == "":
+        return []
+
+    text = str(visit_str).strip()
+    lines = [l.strip() for l in text.replace("\\n", "\n").split("\n") if l.strip()]
+
+    # --- 週N回 / 曜日の抽出 ---
+    freq = 0
+    weekdays = []
+    for line in lines:
+        # 週N回(月水金) パターン
+        m = re.match(r"週(\d+)回[（(]([月火水木金土日]+)[)）]", line)
+        if m:
+            freq = int(m.group(1))
+            weekdays = list(m.group(2))
+            continue
+        # 週N回 (曜日指定なし)
+        m = re.match(r"週(\d+)回", line)
+        if m:
+            freq = int(m.group(1))
+            continue
+
+    # 曜日指定がない場合、頻度に基づいてデフォルト割り当て
+    if not weekdays:
+        if freq >= 7:
+            weekdays = list(WEEKDAY_NAMES)  # 全曜日
+        elif freq == 6:
+            weekdays = WEEKDAY_NAMES[:6]    # 月〜土
+        elif freq == 5:
+            weekdays = WEEKDAY_NAMES[:5]    # 月〜金
+        elif freq == 4:
+            weekdays = ["月", "火", "木", "金"]
+        elif freq == 3:
+            weekdays = ["月", "水", "金"]
+        elif freq == 2:
+            weekdays = ["火", "金"]
+        elif freq == 1:
+            weekdays = ["水"]
+        else:
+            weekdays = WEEKDAY_NAMES[:5]  # フォールバック: 平日
+
+    # --- 1日N回 ---
+    times_per_day = 1
+    for line in lines:
+        m = re.search(r"1日(\d+)回", line)
+        if m:
+            times_per_day = int(m.group(1))
+
+    # --- 基本所要時間 ---
+    base_duration = 30  # デフォルト
+    for line in lines:
+        m = re.search(r"1回(\d+)分", line)
+        if m:
+            base_duration = int(m.group(1))
+
+    # --- 曜日別所要時間 (例: "月金は60分", "水は30分") ---
+    weekday_durations = {}
+    for line in lines:
+        m = re.match(r"([月火水木金土日]+)は(\d+)分", line)
+        if m:
+            for wd in list(m.group(1)):
+                weekday_durations[wd] = int(m.group(2))
+
+    # --- 固定時間 (例: "9:30〜", "13:00〜") ---
+    fixed_time = None
+    for line in lines:
+        m = re.search(r"(\d{1,2}:\d{2})[〜~]?$", line)
+        if m and not re.match(r"1回\d+分", line) and "迎え" not in line and "送り" not in line:
+            fixed_time = m.group(1)
+            # "9:30" → "09:30" に正規化
+            parts = fixed_time.split(":")
+            fixed_time = f"{int(parts[0]):02d}:{parts[1]}"
+
+    # --- 午後指定 ---
+    is_afternoon = False
+    for line in lines:
+        if line == "午後" or "午後" in line:
+            # "午後" 単独の場合、13:00〜 として扱う
+            is_afternoon = True
+            if fixed_time is None:
+                fixed_time = "13:00"
+
+    # --- 結果の組み立て ---
+    results = []
+    for wd in weekdays:
+        duration = weekday_durations.get(wd, base_duration)
+        for _ in range(times_per_day):
+            results.append({
+                "weekday": wd,
+                "duration": duration,
+                "fixed_time": fixed_time,
+                "afternoon": is_afternoon,
+            })
+
+    return results
+
+
+def parse_day_service(ds_str):
+    """デイサービス情報をパースし、曜日ごとの不在時間帯を返す。
+
+    入力例:
+      "週2回(水金)\n迎え9:40\n送り14:45"
+      "週3回(月水金)\n迎え8:50\n送り12:00"
+
+    返り値: dict
+      {"水": ("09:40", "14:45"), "金": ("09:40", "14:45")}
+    """
+    if pd.isna(ds_str) or str(ds_str).strip() == "":
+        return {}
+
+    text = str(ds_str).strip()
+    lines = [l.strip() for l in text.replace("\\n", "\n").split("\n") if l.strip()]
+
+    # 曜日抽出
+    weekdays = []
+    for line in lines:
+        m = re.match(r"週\d+回[（(]([月火水木金土日]+)[)）]", line)
+        if m:
+            weekdays = list(m.group(1))
+            break
+
+    # 迎え・送り時刻
+    pickup_time = None
+    dropoff_time = None
+    for line in lines:
+        m = re.search(r"迎え\s*(\d{1,2}:\d{2})", line)
+        if m:
+            t = m.group(1)
+            parts = t.split(":")
+            pickup_time = f"{int(parts[0]):02d}:{parts[1]}"
+        m = re.search(r"送り\s*(\d{1,2}:\d{2})", line)
+        if m:
+            t = m.group(1)
+            parts = t.split(":")
+            dropoff_time = f"{int(parts[0]):02d}:{parts[1]}"
+
+    if not weekdays or not pickup_time or not dropoff_time:
+        return {}
+
+    return {wd: (pickup_time, dropoff_time) for wd in weekdays}
+
+
+def map_insurance_type(insurance_str):
+    """保険種別文字列を判定フラグに変換する。
+
+    入力: "精神", "医療", "介護" 等
+    返り値: dict {"判定_障がい": bool, "判定_医療": bool, "判定_介護": bool}
+    """
+    s = str(insurance_str).strip() if not pd.isna(insurance_str) else ""
+    return {
+        "判定_障がい": s in ("精神", "障がい", "障害"),
+        "判定_医療": s == "医療",
+        "判定_介護": s == "介護",
+    }
+
+
+def expand_integrated_to_care_plan(integrated_df, target_dates):
+    """統合入力データを、従来のケアプラン形式 (曜日ベース) に展開する。
+
+    Args:
+        integrated_df: 統合入力DataFrame (状況, 利用者名, 訪問日, デイサービス, 保険)
+        target_dates: 対象日付のリスト (datetime)
+
+    Returns:
+        care_df: ケアプラン相当DataFrame
+        master_df: 利用者マスタ相当DataFrame
+        user_ds_constraints: 利用者ごとのデイサービス制約 {利用者名: {曜日: (from, to)}}
+    """
+    # 対象曜日を取得
+    target_weekdays = set()
+    for d in target_dates:
+        target_weekdays.add(WEEKDAY_JP[d.weekday()])
+
+    care_rows = []
+    master_rows = []
+    user_ds_constraints = {}
+    seen_users = set()
+
+    # 「訪問中」のみ処理
+    active_df = integrated_df[
+        integrated_df["状況"].astype(str).str.strip() == "訪問中"
+    ] if "状況" in integrated_df.columns else integrated_df
+
+    for _, row in active_df.iterrows():
+        user_name = str(row["利用者名"]).strip()
+        visit_str = row.get("訪問日", "")
+        ds_str = row.get("デイサービス", "")
+        insurance_str = row.get("保険", "")
+
+        # マスタ情報 (1利用者1行)
+        if user_name not in seen_users:
+            seen_users.add(user_name)
+            ins_flags = map_insurance_type(insurance_str)
+            master_row = {
+                "利用者名": user_name,
+                "住所": "",
+                "判定_障がい": ins_flags["判定_障がい"],
+                "判定_医療": ins_flags["判定_医療"],
+                "判定_介護": ins_flags["判定_介護"],
+            }
+            # 建物名・階数・部屋番号が元データにあれば引き継ぐ
+            for col in ["建物名", "階数", "部屋番号"]:
+                if col in row.index:
+                    master_row[col] = row[col]
+            master_rows.append(master_row)
+
+        # デイサービス制約
+        ds_constraints = parse_day_service(ds_str)
+        if ds_constraints:
+            user_ds_constraints[user_name] = ds_constraints
+
+        # 訪問スケジュールをパースしてケアプラン行に展開
+        schedule_items = parse_visit_schedule(visit_str)
+        for item in schedule_items:
+            wd = item["weekday"]
+            # 対象曜日のみ展開
+            if wd not in target_weekdays:
+                continue
+
+            # デイサービスの日の処理
+            user_ng_time = ""
+            if wd in ds_constraints:
+                ds_from, ds_to = ds_constraints[wd]
+                if item["fixed_time"]:
+                    # 固定時間指定がデイサービス不在時間内ならスキップ
+                    ft = parse_time(item["fixed_time"])
+                    ds_start = parse_time(ds_from)
+                    ds_end = parse_time(ds_to)
+                    if ft and ds_start and ds_end and ds_start <= ft < ds_end:
+                        continue
+                else:
+                    # フリータスク → 不在時間帯をNG制約として付与
+                    user_ng_time = f"{ds_from}-{ds_to}"
+
+            care_rows.append({
+                "利用者名": user_name,
+                "曜日": wd,
+                "頻度": "週1回",  # 展開済みなので各行は週1回
+                "固定時間指定": item["fixed_time"] if item["fixed_time"] else "",
+                "所要時間": item["duration"],
+                "サービス種類": "訪問看護",
+                "利用者NG時間帯": user_ng_time,
+            })
+
+    care_df = pd.DataFrame(care_rows) if care_rows else pd.DataFrame(
+        columns=["利用者名", "曜日", "頻度", "固定時間指定", "所要時間", "サービス種類"]
+    )
+    master_df = pd.DataFrame(master_rows) if master_rows else pd.DataFrame(
+        columns=["利用者名", "住所", "判定_障がい", "判定_医療", "判定_介護"]
+    )
+
+    return care_df, master_df, user_ds_constraints
+
+
+def generate_default_shift(staff_names, target_dates):
+    """デフォルトのシフト情報を生成する。
+
+    全スタッフに対し、対象日付すべてで 09:00-18:00 / NG 12:00-13:00 を設定。
+
+    Args:
+        staff_names: スタッフ名リスト
+        target_dates: 対象日付リスト (datetime)
+
+    Returns:
+        DataFrame (日付, スタッフ名, 開始時間, 終了時間, NG時間帯)
+    """
+    rows = []
+    for d in target_dates:
+        date_str = d.strftime("%Y-%m-%d")
+        for name in staff_names:
+            rows.append({
+                "日付": date_str,
+                "スタッフ名": name,
+                "開始時間": DEFAULT_SHIFT_START,
+                "終了時間": DEFAULT_SHIFT_END,
+                "NG時間帯": DEFAULT_SHIFT_NG,
+            })
+    return pd.DataFrame(rows)
+
+
+def detect_input_mode():
+    """入力モードを判定する。
+
+    統合入力フォルダ (00_integrated) にExcelがあれば "integrated" モード、
+    従来の3フォルダにファイルがあれば "classic" モード。
+
+    Returns:
+        ("integrated", filepath) or ("classic", None)
+    """
+    integrated_files = sorted(glob.glob(os.path.join(INTEGRATED_DIR, "*.xlsx")))
+    integrated_files = [f for f in integrated_files if not os.path.basename(f).startswith("~$")]
+
+    if integrated_files:
+        # 最新ファイルを採用
+        if len(integrated_files) > 1:
+            integrated_files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+            chosen = integrated_files[0]
+            print(f"  [情報] 統合入力フォルダに複数ファイルあり ({len(integrated_files)}件) → 最新を採用")
+            print(f"    採用: {os.path.basename(chosen)}")
+        else:
+            chosen = integrated_files[0]
+        return "integrated", chosen
+
+    return "classic", None
+
+
+# ====================================================================
 # Greedy 割り当てロジック
 # ====================================================================
 
@@ -468,6 +801,7 @@ def assign_tasks_for_date(day_staff_df, day_tasks_fixed, day_tasks_free,
         task_floor = safe_int(task_row.get("階数", None), default=0)
         task_building = safe_str(task_row.get("建物名", None), default="")
         task_rank = safe_int(task_row.get("ランク", None), default=1)
+        user_ng = safe_str(task_row.get("利用者NG時間帯", None), default="")
 
         # 全候補 (スタッフ, 開始スロット) を列挙してスコアリング
         best_candidate = None
@@ -483,6 +817,15 @@ def assign_tasks_for_date(day_staff_df, day_tasks_fixed, day_tasks_free,
                 needed_slots = list(range(start_idx, start_idx + slot_count))
                 if not _is_slot_range_available(needed_slots, staff_name, staff_info):
                     continue
+                # 利用者NG時間帯チェック (デイサービス不在等)
+                if user_ng:
+                    ng_conflict = False
+                    for idx in needed_slots:
+                        if is_in_ng_range(TIME_SLOTS[idx], user_ng):
+                            ng_conflict = True
+                            break
+                    if ng_conflict:
+                        continue
 
                 # スコア計算: 負荷 + 動線 + 累積移動ペナルティ + ジッター
                 movement = calculate_movement_score(
@@ -701,34 +1044,8 @@ def archive_files(file_paths, timestamp_str):
 # メイン処理
 # ====================================================================
 
-def main():
-    print("=" * 60)
-    print("CareRoute Optimizer - 訪問看護・介護スケジュール自動生成")
-    print("=" * 60)
-
-    now = datetime.now()
-    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-
-    # 1. フォルダ初期化
-    print("\n[1/7] フォルダ初期化...")
-    ensure_directories()
-    print("  完了")
-
-    # 2. 入力ファイル探索
-    print("\n[2/7] 入力ファイル探索...")
-    shift_file = find_excel_in_folder("01_shift")
-    care_file = find_excel_in_folder("02_care")
-    master_file = find_excel_in_folder("03_master")
-    used_files = [shift_file, care_file, master_file]
-
-    # 3. データ読み込み
-    print("\n[3/7] データ読み込み...")
-    staff_shift = load_excel(shift_file, "01_shift")
-    care_plan = load_excel(care_file, "02_care")
-    medical_master = load_excel(master_file, "03_master")
-
-    # 4. データ結合
-    print("\n[4/7] データ結合...")
+def _prepare_merged_df(care_plan, medical_master):
+    """ケアプランとマスタを結合し、欠損列を補填してソート済みDataFrameを返す。"""
     merged = care_plan.merge(medical_master, on="利用者名", how="left")
 
     # オプション列が無い場合に備えてデフォルト値を補填
@@ -761,7 +1078,113 @@ def main():
         ["_sort_time", "_sort_building", "_sort_floor"]
     ).drop(columns=["_sort_time", "_sort_building", "_sort_floor"])
 
-    print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件 (固定: {n_fixed}件, フリー: {n_free}件)")
+    return merged, n_fixed, n_free
+
+
+def main():
+    print("=" * 60)
+    print("CareRoute Optimizer - 訪問看護・介護スケジュール自動生成")
+    print("=" * 60)
+
+    now = datetime.now()
+    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+
+    # 1. フォルダ初期化
+    print("\n[1/7] フォルダ初期化...")
+    ensure_directories()
+    print("  完了")
+
+    # 2. 入力モード判定
+    print("\n[2/7] 入力ファイル探索...")
+    input_mode, integrated_file = detect_input_mode()
+
+    if input_mode == "integrated":
+        # ============================================================
+        # 統合入力モード
+        # ============================================================
+        print(f"  入力モード: 統合 (1ファイル)")
+        print(f"  統合ファイル: {os.path.basename(integrated_file)}")
+        used_files = [integrated_file]
+
+        # 3. データ読み込み
+        print("\n[3/7] 統合データ読み込み...")
+        try:
+            integrated_df = pd.read_excel(integrated_file, sheet_name=0, engine="openpyxl")
+        except Exception as e:
+            print(f"[エラー] 統合ファイルの読み込みに失敗しました: {e}")
+            sys.exit(1)
+        print(f"  統合入力: {len(integrated_df)} 件")
+
+        # 「訪問中」のみ抽出
+        if "状況" in integrated_df.columns:
+            active = integrated_df[integrated_df["状況"].astype(str).str.strip() == "訪問中"]
+            skipped = len(integrated_df) - len(active)
+            if skipped > 0:
+                print(f"  [情報] 「訪問中」以外の {skipped} 件をスキップ")
+        else:
+            active = integrated_df
+
+        # 対象日付の決定: シフトファイルがあればそこから、なければ今週の月〜日
+        shift_files = sorted(glob.glob(os.path.join(SHIFT_DIR, "*.xlsx")))
+        shift_files = [f for f in shift_files if not os.path.basename(f).startswith("~$")]
+
+        if shift_files:
+            # シフトファイルがあれば従来通り読み込み
+            shift_file = shift_files[-1]  # 最新
+            print(f"  シフトファイル: {os.path.basename(shift_file)}")
+            staff_shift = load_excel(shift_file, "01_shift")
+            used_files.append(shift_file)
+            target_dates = [pd.to_datetime(d) for d in staff_shift["日付"].unique()]
+        else:
+            # シフトファイルなし → 今週月〜日のデフォルトシフトを生成
+            print("  [情報] シフトファイルなし → デフォルトシフトを自動生成")
+            today = datetime.now()
+            # 今週の月曜日を起点
+            monday = today - timedelta(days=today.weekday())
+            target_dates = [monday + timedelta(days=i) for i in range(7)]
+
+            # デフォルトスタッフ名 (仮) → ユーザーに要確認
+            default_staff = ["スタッフA", "スタッフB", "スタッフC", "スタッフD", "スタッフE"]
+            staff_shift = generate_default_shift(default_staff, target_dates)
+            print(f"  デフォルトスタッフ: {', '.join(default_staff)}")
+            print(f"  対象期間: {target_dates[0].strftime('%Y-%m-%d')} ～ {target_dates[-1].strftime('%Y-%m-%d')}")
+
+        # 4. 統合データ → ケアプラン + マスタに展開
+        print("\n[4/7] データ変換 (統合 → ケアプラン + マスタ)...")
+        care_plan, medical_master, user_ds_constraints = expand_integrated_to_care_plan(
+            integrated_df, target_dates
+        )
+        print(f"  ケアプラン: {len(care_plan)} 件に展開")
+        print(f"  利用者マスタ: {len(medical_master)} 名")
+        if user_ds_constraints:
+            print(f"  デイサービス制約: {len(user_ds_constraints)} 名")
+            for uname, constraints in user_ds_constraints.items():
+                days_str = ",".join(sorted(constraints.keys()))
+                print(f"    {uname}: {days_str}")
+
+        merged, n_fixed, n_free = _prepare_merged_df(care_plan, medical_master)
+        print(f"  結合結果: {len(merged)} 件 (固定: {n_fixed}件, フリー: {n_free}件)")
+
+    else:
+        # ============================================================
+        # 従来モード (3フォルダ)
+        # ============================================================
+        print(f"  入力モード: クラシック (3フォルダ)")
+        shift_file = find_excel_in_folder("01_shift")
+        care_file = find_excel_in_folder("02_care")
+        master_file = find_excel_in_folder("03_master")
+        used_files = [shift_file, care_file, master_file]
+
+        # 3. データ読み込み
+        print("\n[3/7] データ読み込み...")
+        staff_shift = load_excel(shift_file, "01_shift")
+        care_plan = load_excel(care_file, "02_care")
+        medical_master = load_excel(master_file, "03_master")
+
+        # 4. データ結合
+        print("\n[4/7] データ結合...")
+        merged, n_fixed, n_free = _prepare_merged_df(care_plan, medical_master)
+        print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件 (固定: {n_fixed}件, フリー: {n_free}件)")
 
     # 5. 割り当て & Excel生成
     print("\n[5/7] スコアリング割り当て & マトリクスExcel生成...")
