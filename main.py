@@ -385,6 +385,8 @@ def parse_day_service(ds_str):
     入力例:
       "週2回(水金)\n迎え9:40\n送り14:45"
       "週3回(月水金)\n迎え8:50\n送り12:00"
+      "週1(月金)\n迎え10:30"           ← "回"省略 + "送り"なし
+      "週2(水土)\n迎え9:30\n送り15:00"  ← "回"省略
 
     返り値: dict
       {"水": ("09:40", "14:45"), "金": ("09:40", "14:45")}
@@ -395,10 +397,10 @@ def parse_day_service(ds_str):
     text = str(ds_str).strip()
     lines = [l.strip() for l in text.replace("\\n", "\n").split("\n") if l.strip()]
 
-    # 曜日抽出
+    # 曜日抽出 ("回" は省略可)
     weekdays = []
     for line in lines:
-        m = re.match(r"週\d+回[（(]([月火水木金土日]+)[)）]", line)
+        m = re.match(r"週\d+回?[（(]([月火水木金土日]+)[)）]", line)
         if m:
             weekdays = list(m.group(1))
             break
@@ -418,8 +420,12 @@ def parse_day_service(ds_str):
             parts = t.split(":")
             dropoff_time = f"{int(parts[0]):02d}:{parts[1]}"
 
-    if not weekdays or not pickup_time or not dropoff_time:
+    if not weekdays or not pickup_time:
         return {}
+
+    # 「送り」がない場合は業務終了時間 (18:00) まで不在として扱う
+    if not dropoff_time:
+        dropoff_time = "18:00"
 
     return {wd: (pickup_time, dropoff_time) for wd in weekdays}
 
