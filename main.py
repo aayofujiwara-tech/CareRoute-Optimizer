@@ -292,14 +292,14 @@ def parse_visit_schedule(visit_str):
     freq = 0
     weekdays = []
     for line in lines:
-        # 週N回(月水金) パターン
-        m = re.match(r"週(\d+)回[（(]([月火水木金土日]+)[)）]", line)
+        # 週N回(月水金) パターン ("回" 省略可)
+        m = re.match(r"週(\d+)回?[（(]([月火水木金土日]+)[)）]", line)
         if m:
             freq = int(m.group(1))
             weekdays = list(m.group(2))
             continue
-        # 週N回 (曜日指定なし)
-        m = re.match(r"週(\d+)回", line)
+        # 週N回 (曜日指定なし, "回" 省略可)
+        m = re.match(r"週(\d+)回?(?!\d)", line)
         if m:
             freq = int(m.group(1))
             continue
