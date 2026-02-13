@@ -71,10 +71,10 @@ FOLDER_CONFIG = {
     },
 }
 
-# 時間軸: 09:00 - 18:00 (30分刻み)
+# 時間軸: 09:00 - 17:30 (30分刻み, 実例準拠)
 TIME_SLOTS = []
 _t = datetime(2000, 1, 1, 9, 0)
-while _t <= datetime(2000, 1, 1, 18, 0):
+while _t <= datetime(2000, 1, 1, 17, 30):
     TIME_SLOTS.append(_t.strftime("%H:%M"))
     _t += timedelta(minutes=30)
 
@@ -876,28 +876,68 @@ def assign_tasks_for_date(day_staff_df, day_tasks_fixed, day_tasks_free,
 # Excel生成 (マトリクスレイアウト)
 # ====================================================================
 
-def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
-    """割り当て結果をガントチャート風マトリクスExcelとして出力する。"""
+def build_matrix_excel(staff_shift_df, merged_df, timestamp_str, master_df=None):
+    """割り当て結果をガントチャート風マトリクスExcelとして出力する。
+
+    実例 (週間スケジュール実例.xlsx) 準拠レイアウト:
+      行1: ヘッダー (B1=訪問予定, D1=開始日, E1=～, F1=終了日)
+      行18: 時間ヘッダー (E-V: 09:00〜17:30)
+      行19〜: 曜日ブロック
+        B列: 曜日 (ブロック内セル結合)
+        C列: 日付 (ブロック内セル結合)
+        D列: スタッフ名
+        E-V列: タスクセル (同一タスクはセル結合)
+      右端: 利用者マスタ一覧 (X列〜)
+    """
     wb = Workbook()
     ws = wb.active
     ws.title = "週間スケジュール"
 
-    # --- ヘッダー行 ---
-    headers = ["日付", "スタッフ名"] + TIME_SLOTS
-    for col_idx, header in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
+    # 定数: 列オフセット
+    COL_WEEKDAY = 2    # B列: 曜日
+    COL_DATE = 3       # C列: 日付
+    COL_STAFF = 4      # D列: スタッフ名
+    COL_TIME_START = 5 # E列: 最初の時間スロット (09:00)
+    ROWS_PER_BLOCK = 7 # 各曜日ブロックの行数 (スタッフ行 + 余白)
+    HEADER_ROW = 17    # 時間ヘッダー行 (実例では18だが0-indexed調整で17)
+    DATA_START_ROW = 18  # データ開始行
+
+    # --- 行1: タイトルヘッダー ---
+    dates = sorted(staff_shift_df["日付"].unique())
+    try:
+        first_date = pd.to_datetime(dates[0])
+        last_date = pd.to_datetime(dates[-1])
+    except Exception:
+        first_date = datetime.now()
+        last_date = first_date + timedelta(days=6)
+
+    ws.cell(row=1, column=COL_WEEKDAY, value="訪問予定").font = Font(bold=True, size=12)
+    ws.cell(row=1, column=COL_STAFF, value=first_date.strftime("%Y/%m/%d")).font = FONT_HEADER
+    ws.cell(row=1, column=COL_TIME_START, value="～").font = FONT_HEADER
+    ws.cell(row=1, column=COL_TIME_START + 1, value=last_date.strftime("%Y/%m/%d")).font = FONT_HEADER
+
+    # --- 時間ヘッダー行 ---
+    for slot_idx, slot_label in enumerate(TIME_SLOTS):
+        col = COL_TIME_START + slot_idx
+        cell = ws.cell(row=HEADER_ROW, column=col, value=slot_label)
         cell.fill = FILL_HEADER
         cell.font = FONT_HEADER
         cell.border = THIN_BORDER
         cell.alignment = ALIGN_CENTER
 
-    # --- 日付ごとに割り当て → 書き込み ---
-    dates = staff_shift_df["日付"].unique()
-    current_row = 2
+    # B-D列のヘッダーも設定
+    for col_idx, label in [(COL_WEEKDAY, "曜日"), (COL_DATE, "日付"), (COL_STAFF, "スタッフ")]:
+        cell = ws.cell(row=HEADER_ROW, column=col_idx, value=label)
+        cell.fill = FILL_HEADER
+        cell.font = FONT_HEADER
+        cell.border = THIN_BORDER
+        cell.alignment = ALIGN_CENTER
+
+    # --- 割り当て計算 ---
     all_warnings = []
-    # 全日程を通じたスタッフ別統計・累積状態
     global_stats = {}
-    carry_over = {}  # 日をまたいで累積ランクを引き継ぐ
+    carry_over = {}
+    all_assignments = {}  # {date_val: {staff_name: [(slots, task_row), ...]}}
 
     # ケアプランを曜日別に整理 (固定/フリー分離)
     fixed_by_weekday = {}
@@ -906,13 +946,12 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
         weekday = str(task_row["曜日"]).strip()
         fixed_time = task_row.get("固定時間指定", None)
         is_free = pd.isna(fixed_time) or str(fixed_time).strip() == ""
-
         if is_free:
             free_by_weekday.setdefault(weekday, []).append(task_row)
         else:
             fixed_by_weekday.setdefault(weekday, []).append(task_row)
 
-    for date_val in sorted(dates):
+    for date_val in dates:
         try:
             date_obj = pd.to_datetime(date_val)
             weekday_jp = WEEKDAY_JP[date_obj.weekday()]
@@ -922,20 +961,13 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             date_display = str(date_val)
 
         day_staff_df = staff_shift_df[staff_shift_df["日付"] == date_val]
-
-        # この曜日の固定/フリータスクを取得
         fixed_list = fixed_by_weekday.get(weekday_jp, [])
         free_list = free_by_weekday.get(weekday_jp, [])
         day_fixed_df = pd.DataFrame(fixed_list) if fixed_list else pd.DataFrame()
         day_free_df = pd.DataFrame(free_list) if free_list else pd.DataFrame()
 
-        # 2段階割り当て実行
         has_tasks = not day_fixed_df.empty or not day_free_df.empty
         if has_tasks:
-            if day_fixed_df.empty:
-                day_fixed_df = pd.DataFrame()
-            if day_free_df.empty:
-                day_free_df = pd.DataFrame()
             assignments, warnings, day_stats, carry_over = assign_tasks_for_date(
                 day_staff_df, day_fixed_df, day_free_df, date_display, carry_over
             )
@@ -948,26 +980,71 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
         else:
             assignments = {row["スタッフ名"]: [] for _, row in day_staff_df.iterrows()}
 
-        # 各スタッフの行を書き込む
-        for _, staff_row in day_staff_df.iterrows():
+        all_assignments[date_val] = assignments
+
+    # --- 曜日ブロック書き込み ---
+    current_row = DATA_START_ROW
+    for date_val in dates:
+        try:
+            date_obj = pd.to_datetime(date_val)
+            weekday_jp = WEEKDAY_JP[date_obj.weekday()]
+            date_display = date_obj.strftime("%m/%d")
+        except Exception:
+            weekday_jp = "?"
+            date_display = str(date_val)
+
+        day_staff_df = staff_shift_df[staff_shift_df["日付"] == date_val]
+        staff_names = day_staff_df["スタッフ名"].tolist()
+        assignments = all_assignments.get(date_val, {})
+
+        block_start_row = current_row
+        # スタッフ行数 = 実スタッフ数 (最低1行)
+        num_staff_rows = max(len(staff_names), 1)
+        block_end_row = block_start_row + num_staff_rows - 1
+
+        # B列: 曜日 (セル結合)
+        wd_cell = ws.cell(row=block_start_row, column=COL_WEEKDAY, value=weekday_jp)
+        wd_cell.font = Font(bold=True, size=11)
+        wd_cell.border = THIN_BORDER
+        wd_cell.alignment = ALIGN_CENTER
+        if num_staff_rows > 1:
+            ws.merge_cells(
+                start_row=block_start_row, start_column=COL_WEEKDAY,
+                end_row=block_end_row, end_column=COL_WEEKDAY,
+            )
+            # 結合後も罫線を設定
+            for r in range(block_start_row, block_end_row + 1):
+                ws.cell(row=r, column=COL_WEEKDAY).border = THIN_BORDER
+
+        # C列: 日付 (セル結合)
+        dt_cell = ws.cell(row=block_start_row, column=COL_DATE, value=date_display)
+        dt_cell.font = FONT_CELL
+        dt_cell.border = THIN_BORDER
+        dt_cell.alignment = ALIGN_CENTER
+        if num_staff_rows > 1:
+            ws.merge_cells(
+                start_row=block_start_row, start_column=COL_DATE,
+                end_row=block_end_row, end_column=COL_DATE,
+            )
+            for r in range(block_start_row, block_end_row + 1):
+                ws.cell(row=r, column=COL_DATE).border = THIN_BORDER
+
+        # 各スタッフ行を書き込む
+        for staff_idx, (_, staff_row) in enumerate(day_staff_df.iterrows()):
+            row = block_start_row + staff_idx
             staff_name = staff_row["スタッフ名"]
 
-            # A列: 日付, B列: スタッフ名
-            date_cell = ws.cell(row=current_row, column=1, value=date_display)
-            date_cell.border = THIN_BORDER
-            date_cell.font = FONT_CELL
-            date_cell.alignment = ALIGN_CENTER
-
-            name_cell = ws.cell(row=current_row, column=2, value=staff_name)
+            # D列: スタッフ名
+            name_cell = ws.cell(row=row, column=COL_STAFF, value=staff_name)
             name_cell.border = THIN_BORDER
             name_cell.font = FONT_CELL
             name_cell.alignment = ALIGN_CENTER
 
-            # 全スロットに罫線を設定 + NG時間帯に「休憩」表示
+            # E-V列: 全スロットに罫線設定 + NG時間帯
             ng_range = staff_row["NG時間帯"]
             for slot_idx in range(len(TIME_SLOTS)):
-                col = slot_idx + 3
-                cell = ws.cell(row=current_row, column=col)
+                col = COL_TIME_START + slot_idx
+                cell = ws.cell(row=row, column=col)
                 cell.border = THIN_BORDER
                 cell.font = FONT_CELL
                 cell.alignment = ALIGN_CENTER
@@ -975,37 +1052,89 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
                     cell.value = "休憩"
                     cell.fill = FILL_HEADER
 
-            # 割り当て済みタスクを書き込む
+            # タスクを書き込む (セル結合あり)
             for slot_indices, task_row in assignments.get(staff_name, []):
                 user_name = safe_str(task_row["利用者名"])
                 service = safe_str(task_row.get("サービス種類", None), default="")
                 fill = get_fill_for_user(task_row)
 
-                # 開始時刻を取得
                 start_time = TIME_SLOTS[slot_indices[0]] if slot_indices else ""
-
-                # 表示: "時刻\n利用者名" (実例準拠)
                 display_text = f"{start_time}\n{user_name}"
-                # サービス種類が「訪問看護」以外なら補足表示
                 if service and service != "訪問看護":
                     display_text = f"{start_time}\n{user_name}（{service}）"
 
-                for idx in slot_indices:
-                    col = idx + 3
-                    cell = ws.cell(row=current_row, column=col)
-                    cell.value = display_text
-                    cell.fill = fill
+                # 最初のセルに値を書き込み
+                first_col = COL_TIME_START + slot_indices[0]
+                cell = ws.cell(row=row, column=first_col)
+                cell.value = display_text
+                cell.fill = fill
+                cell.font = FONT_CELL
+                cell.alignment = ALIGN_CENTER
 
-            current_row += 1
+                # 複数スロットにまたがる場合はセル結合
+                if len(slot_indices) > 1:
+                    last_col = COL_TIME_START + slot_indices[-1]
+                    ws.merge_cells(
+                        start_row=row, start_column=first_col,
+                        end_row=row, end_column=last_col,
+                    )
+                    # 結合セル全体に背景色・罫線を設定
+                    for idx in slot_indices:
+                        c = COL_TIME_START + idx
+                        ws.cell(row=row, column=c).fill = fill
+                        ws.cell(row=row, column=c).border = THIN_BORDER
+
+        current_row = block_end_row + 1
+
+    # --- 右側: 利用者マスタ一覧 ---
+    MASTER_COL_START = COL_TIME_START + len(TIME_SLOTS) + 1  # 1列空けて配置
+    master_headers = ["状況", "利用者名", "訪問日", "DS", "保険"]
+    if master_df is not None and not master_df.empty:
+        # ヘッダー
+        for i, h in enumerate(master_headers):
+            col = MASTER_COL_START + i
+            cell = ws.cell(row=HEADER_ROW, column=col, value=h)
+            cell.fill = FILL_HEADER
+            cell.font = FONT_HEADER
+            cell.border = THIN_BORDER
+            cell.alignment = ALIGN_CENTER
+
+        # データ行
+        master_row = DATA_START_ROW
+        for _, mrow in master_df.iterrows():
+            user_name = safe_str(mrow.get("利用者名", ""), "")
+            status = safe_str(mrow.get("状況", ""), "")
+            visit = safe_str(mrow.get("訪問日", ""), "")
+            ds = safe_str(mrow.get("デイサービス", ""), "")
+            insurance = safe_str(mrow.get("保険", ""), "")
+
+            values = [status, user_name, visit, ds, insurance]
+            for i, val in enumerate(values):
+                col = MASTER_COL_START + i
+                cell = ws.cell(row=master_row, column=col, value=val)
+                cell.font = FONT_CELL
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(
+                    horizontal="left", vertical="center", wrap_text=True
+                )
+            master_row += 1
 
     # --- 列幅・行高さ調整 ---
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions[get_column_letter(COL_WEEKDAY)].width = 5   # B: 曜日
+    ws.column_dimensions[get_column_letter(COL_DATE)].width = 8      # C: 日付
+    ws.column_dimensions[get_column_letter(COL_STAFF)].width = 10    # D: スタッフ
     for slot_idx in range(len(TIME_SLOTS)):
-        col_letter = get_column_letter(slot_idx + 3)
-        ws.column_dimensions[col_letter].width = 18
-    for row_idx in range(2, current_row):
-        ws.row_dimensions[row_idx].height = 50
+        col_letter = get_column_letter(COL_TIME_START + slot_idx)
+        ws.column_dimensions[col_letter].width = 14
+    # マスタ列の幅
+    if master_df is not None:
+        master_widths = [6, 14, 20, 20, 6]
+        for i, w in enumerate(master_widths):
+            col_letter = get_column_letter(MASTER_COL_START + i)
+            ws.column_dimensions[col_letter].width = w
+    # 行高さ
+    for row_idx in range(DATA_START_ROW, current_row):
+        ws.row_dimensions[row_idx].height = 40
 
     # --- 保存 ---
     filename = f"週間スケジュール_{timestamp_str}.xlsx"
@@ -1166,6 +1295,9 @@ def main():
         merged, n_fixed, n_free = _prepare_merged_df(care_plan, medical_master)
         print(f"  結合結果: {len(merged)} 件 (固定: {n_fixed}件, フリー: {n_free}件)")
 
+        # 右側マスタ表示用に元データを保持
+        right_master_df = integrated_df
+
     else:
         # ============================================================
         # 従来モード (3フォルダ)
@@ -1186,11 +1318,12 @@ def main():
         print("\n[4/7] データ結合...")
         merged, n_fixed, n_free = _prepare_merged_df(care_plan, medical_master)
         print(f"  ケアプラン + 利用者マスタ → {len(merged)} 件 (固定: {n_fixed}件, フリー: {n_free}件)")
+        right_master_df = None
 
     # 5. 割り当て & Excel生成
     print("\n[5/7] スコアリング割り当て & マトリクスExcel生成...")
     output_path, warnings, global_stats = build_matrix_excel(
-        staff_shift, merged, timestamp_str
+        staff_shift, merged, timestamp_str, master_df=right_master_df
     )
 
     # 6. 割り当て結果サマリ
