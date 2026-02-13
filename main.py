@@ -978,23 +978,17 @@ def build_matrix_excel(staff_shift_df, merged_df, timestamp_str):
             # 割り当て済みタスクを書き込む
             for slot_indices, task_row in assignments.get(staff_name, []):
                 user_name = safe_str(task_row["利用者名"])
-                room = safe_str(task_row.get("部屋番号", None), default="")
-                building = safe_str(task_row.get("建物名", None), default="")
                 service = safe_str(task_row.get("サービス種類", None), default="")
-                # 表示: 利用者名 / 建物名 部屋番号 (サービス種類)
-                location_parts = []
-                if building:
-                    location_parts.append(building)
-                if room:
-                    location_parts.append(room)
-                location = " ".join(location_parts)
-                if location and service:
-                    display_text = f"{user_name}\n{location} ({service})"
-                elif location:
-                    display_text = f"{user_name}\n{location}"
-                else:
-                    display_text = user_name
                 fill = get_fill_for_user(task_row)
+
+                # 開始時刻を取得
+                start_time = TIME_SLOTS[slot_indices[0]] if slot_indices else ""
+
+                # 表示: "時刻\n利用者名" (実例準拠)
+                display_text = f"{start_time}\n{user_name}"
+                # サービス種類が「訪問看護」以外なら補足表示
+                if service and service != "訪問看護":
+                    display_text = f"{start_time}\n{user_name}（{service}）"
 
                 for idx in slot_indices:
                     col = idx + 3
