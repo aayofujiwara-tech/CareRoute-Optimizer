@@ -8,6 +8,10 @@
 # 入力Excel (利用者が配置するファイル)
 01_input/**/*.xlsx
 
+# 解析用データ (実データ — リポジトリに含めない)
+00_analysis/*.xlsx
+00_analysis/*.csv
+
 # Python
 __pycache__/
 *.pyc
