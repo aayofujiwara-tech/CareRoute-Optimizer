@@ -83,9 +83,10 @@ WEEKDAY_JP = {0: "月", 1: "火", 2: "水", 3: "木", 4: "金", 5: "土", 6: "�
 
 # スタイル定義
 FILL_HEADER = PatternFill(start_color="C0C0C0", end_color="C0C0C0", fill_type="solid")
-FILL_DISABILITY = PatternFill(start_color="D8BFD8", end_color="D8BFD8", fill_type="solid")
-FILL_MEDICAL = PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-FILL_CARE = PatternFill(start_color="90EE90", end_color="90EE90", fill_type="solid")
+FILL_MENTAL = PatternFill(start_color="6AA84F", end_color="6AA84F", fill_type="solid")      # 精神 = 緑
+FILL_MEDICAL = PatternFill(start_color="6D9EEB", end_color="6D9EEB", fill_type="solid")     # 医療 = 青
+FILL_CARE = PatternFill(start_color="E69138", end_color="E69138", fill_type="solid")        # 介護 = 橙
+FILL_INFORMAL = PatternFill(start_color="FFE599", end_color="FFE599", fill_type="solid")    # インフォーマル = 黄
 THIN_BORDER = Border(
     left=Side(style="thin"),
     right=Side(style="thin"),
@@ -203,10 +204,10 @@ def safe_int(value, default=0):
 def get_fill_for_user(row):
     """利用者の保険判定に基づく背景色を返す (優先順位付き)。"""
     if normalize_boolean(row.get("判定_障がい", False)):
-        return FILL_DISABILITY
+        return FILL_MENTAL    # 精神 = 緑
     if normalize_boolean(row.get("判定_医療", False)):
-        return FILL_MEDICAL
-    return FILL_CARE
+        return FILL_MEDICAL   # 医療 = 青
+    return FILL_CARE          # 介護 = 橙
 
 
 def parse_time(time_str):
