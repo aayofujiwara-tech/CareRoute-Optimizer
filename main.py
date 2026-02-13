@@ -37,10 +37,11 @@ INTEGRATED_DIR = os.path.join(INPUT_DIR, "00_integrated")
 SHIFT_DIR = os.path.join(INPUT_DIR, "01_shift")
 CARE_DIR = os.path.join(INPUT_DIR, "02_care")
 MASTER_DIR = os.path.join(INPUT_DIR, "03_master")
+ROOM_DIR = os.path.join(INPUT_DIR, "04_room")
 OUTPUT_DIR = os.path.join(BASE_DIR, "02_output")
 ARCHIVE_DIR = os.path.join(BASE_DIR, "99_archive")
 
-ALL_DIRS = [INTEGRATED_DIR, SHIFT_DIR, CARE_DIR, MASTER_DIR, OUTPUT_DIR, ARCHIVE_DIR]
+ALL_DIRS = [INTEGRATED_DIR, SHIFT_DIR, CARE_DIR, MASTER_DIR, ROOM_DIR, OUTPUT_DIR, ARCHIVE_DIR]
 
 # 曜日名の正規化マッピング
 WEEKDAY_NAMES = ["月", "火", "水", "木", "金", "土", "日"]
@@ -415,9 +416,10 @@ def parse_day_service(ds_str):
             t = m.group(1)
             parts = t.split(":")
             pickup_time = f"{int(parts[0]):02d}:{parts[1]}"
-        m = re.search(r"送り\s*(\d{1,2}:\d{2})", line)
+        # 送り時刻: "送り16:00" or "送り16:00-16:40" (範囲の場合は遅い方を採用)
+        m = re.search(r"送り\s*(\d{1,2}:\d{2})(?:\s*[-〜~]\s*(\d{1,2}:\d{2}))?", line)
         if m:
-            t = m.group(1)
+            t = m.group(2) if m.group(2) else m.group(1)  # 範囲なら遅い方
             parts = t.split(":")
             dropoff_time = f"{int(parts[0]):02d}:{parts[1]}"
 
@@ -429,6 +431,54 @@ def parse_day_service(ds_str):
         dropoff_time = "18:00"
 
     return {wd: (pickup_time, dropoff_time) for wd in weekdays}
+
+
+def load_room_map(room_filepath=None):
+    """部屋番号表Excelを読み込み、利用者名→(建物名, 部屋番号, 階数) のマッピングを返す。
+
+    部屋番号表のフォーマット:
+      左3列: パシフィック塚本 (部屋番号=3桁数字, 1行目=カナ, 2行目=漢字)
+      右3列: ルネッサンス塚本 (部屋番号=階数+英字, 1行目=カナ, 2行目=漢字)
+
+    ファイルがない場合は空dictを返す。
+    """
+    if room_filepath is None:
+        room_files = sorted(glob.glob(os.path.join(ROOM_DIR, "*.xlsx")))
+        room_files = [f for f in room_files if not os.path.basename(f).startswith("~$")]
+        if not room_files:
+            return {}
+        room_filepath = room_files[-1]
+
+    try:
+        df = pd.read_excel(room_filepath, sheet_name=0, header=None, engine="openpyxl")
+    except Exception as e:
+        print(f"  [警告] 部屋番号表の読み込み失敗: {e}")
+        return {}
+
+    room_map = {}
+    # 左ブロック: 建物名は行0・列0
+    left_building = str(df.iloc[0, 0]).strip() if pd.notna(df.iloc[0, 0]) else "建物A"
+    # 右ブロック: 建物名は行0・列3
+    right_building = str(df.iloc[0, 3]).strip() if pd.notna(df.iloc[0, 3]) else "建物B"
+
+    for i in range(1, len(df), 2):
+        # 左ブロック
+        room_val = df.iloc[i, 0]
+        kanji = df.iloc[i + 1, 1] if i + 1 < len(df) and pd.notna(df.iloc[i + 1, 1]) else None
+        if pd.notna(room_val) and kanji:
+            room_s = str(int(room_val)) if isinstance(room_val, (int, float)) else str(room_val)
+            floor = int(room_s[0]) if room_s and room_s[0].isdigit() else 0
+            room_map[str(kanji).strip()] = (left_building, room_s, floor)
+
+        # 右ブロック
+        room_val = df.iloc[i, 3]
+        kanji = df.iloc[i + 1, 4] if i + 1 < len(df) and pd.notna(df.iloc[i + 1, 4]) else None
+        if pd.notna(room_val) and kanji:
+            room_s = str(room_val).strip()
+            floor = int(room_s[0]) if room_s and room_s[0].isdigit() else 0
+            room_map[str(kanji).strip()] = (right_building, room_s, floor)
+
+    return room_map
 
 
 def map_insurance_type(insurance_str):
@@ -445,18 +495,21 @@ def map_insurance_type(insurance_str):
     }
 
 
-def expand_integrated_to_care_plan(integrated_df, target_dates):
+def expand_integrated_to_care_plan(integrated_df, target_dates, room_map=None):
     """統合入力データを、従来のケアプラン形式 (曜日ベース) に展開する。
 
     Args:
         integrated_df: 統合入力DataFrame (状況, 利用者名, 訪問日, デイサービス, 保険)
         target_dates: 対象日付のリスト (datetime)
+        room_map: 部屋番号表マッピング {利用者名: (建物名, 部屋番号, 階数)}
 
     Returns:
         care_df: ケアプラン相当DataFrame
         master_df: 利用者マスタ相当DataFrame
         user_ds_constraints: 利用者ごとのデイサービス制約 {利用者名: {曜日: (from, to)}}
     """
+    if room_map is None:
+        room_map = {}
     # 対象曜日を取得
     target_weekdays = set()
     for d in target_dates:
@@ -489,10 +542,18 @@ def expand_integrated_to_care_plan(integrated_df, target_dates):
                 "判定_医療": ins_flags["判定_医療"],
                 "判定_介護": ins_flags["判定_介護"],
             }
-            # 建物名・階数・部屋番号が元データにあれば引き継ぐ
-            for col in ["建物名", "階数", "部屋番号"]:
-                if col in row.index:
-                    master_row[col] = row[col]
+            # 部屋番号表から建物・階数・部屋番号を付与
+            name_base = user_name.replace("様", "")
+            if name_base in room_map:
+                bldg, room_no, floor = room_map[name_base]
+                master_row["建物名"] = bldg
+                master_row["部屋番号"] = room_no
+                master_row["階数"] = floor
+            else:
+                # 元データに建物情報があれば引き継ぐ
+                for col in ["建物名", "階数", "部屋番号"]:
+                    if col in row.index:
+                        master_row[col] = row[col]
             master_rows.append(master_row)
 
         # デイサービス制約
@@ -1236,13 +1297,34 @@ def main():
         print(f"  統合ファイル: {os.path.basename(integrated_file)}")
         used_files = [integrated_file]
 
-        # 3. データ読み込み
+        # 3. データ読み込み (ヘッダー行を自動検出)
         print("\n[3/7] 統合データ読み込み...")
         try:
             integrated_df = pd.read_excel(integrated_file, sheet_name=0, engine="openpyxl")
+            # 「利用者名」列がなければヘッダー行がずれている → 先頭行をスキャン
+            if "利用者名" not in integrated_df.columns:
+                df_raw = pd.read_excel(integrated_file, sheet_name=0, header=None, engine="openpyxl")
+                header_row = None
+                for i in range(min(10, len(df_raw))):
+                    row_vals = [str(v).strip() for v in df_raw.iloc[i] if pd.notna(v)]
+                    if "利用者名" in row_vals:
+                        header_row = i
+                        break
+                if header_row is not None:
+                    integrated_df = pd.read_excel(
+                        integrated_file, sheet_name=0, header=header_row, engine="openpyxl"
+                    )
+                    # Unnamed列を除去
+                    integrated_df = integrated_df.loc[
+                        :, ~integrated_df.columns.astype(str).str.startswith("Unnamed")
+                    ]
+                    print(f"  [情報] ヘッダー行を自動検出: 行{header_row + 1}")
         except Exception as e:
             print(f"[エラー] 統合ファイルの読み込みに失敗しました: {e}")
             sys.exit(1)
+        # NaN行を除去
+        if "利用者名" in integrated_df.columns:
+            integrated_df = integrated_df.dropna(subset=["利用者名"])
         print(f"  統合入力: {len(integrated_df)} 件")
 
         # 「訪問中」のみ抽出
@@ -1279,10 +1361,17 @@ def main():
             print(f"  デフォルトスタッフ: {', '.join(default_staff)}")
             print(f"  対象期間: {target_dates[0].strftime('%Y-%m-%d')} ～ {target_dates[-1].strftime('%Y-%m-%d')}")
 
+        # 部屋番号表の読み込み
+        room_map = load_room_map()
+        if room_map:
+            print(f"  部屋番号表: {len(room_map)} 名分の部屋情報を取得")
+        else:
+            print("  [情報] 部屋番号表なし → 建物・階数情報なしで動作")
+
         # 4. 統合データ → ケアプラン + マスタに展開
         print("\n[4/7] データ変換 (統合 → ケアプラン + マスタ)...")
         care_plan, medical_master, user_ds_constraints = expand_integrated_to_care_plan(
-            integrated_df, target_dates
+            integrated_df, target_dates, room_map=room_map
         )
         print(f"  ケアプラン: {len(care_plan)} 件に展開")
         print(f"  利用者マスタ: {len(medical_master)} 名")
