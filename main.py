@@ -280,6 +280,7 @@ def parse_visit_schedule(visit_str):
       "週3回(月水金)\n月金は60分\n水は30分"
       "週1回(木)\n1回30分\n9:30〜"
       "週3回(月水金)\n1回30分\n午後"
+      "月火木金日\n9:30〜\n13:00〜\n16:00〜\n\n水土\n9:00〜\n16:00〜\n\n1日3回\n1回60分"
 
     返り値: list of dict
       [{"weekday": "月", "duration": 30, "fixed_time": None, "afternoon": False}, ...]
@@ -289,6 +290,74 @@ def parse_visit_schedule(visit_str):
 
     text = str(visit_str).strip()
     lines = [l.strip() for l in text.replace("\\n", "\n").split("\n") if l.strip()]
+
+    # --- 基本所要時間 (全パターン共通) ---
+    base_duration = 30  # デフォルト
+    for line in lines:
+        m = re.search(r"1回(\d+)分", line)
+        if m:
+            base_duration = int(m.group(1))
+
+    # --- 1日N回 (全パターン共通) ---
+    times_per_day = 1
+    for line in lines:
+        m = re.search(r"1日(\d+)回", line)
+        if m:
+            times_per_day = int(m.group(1))
+
+    # --- 曜日グループパターン検出 ---
+    # 「月火木金日」のように曜日文字のみの行があれば、グループ別固定時間モード
+    # 例: 月火木金日\n9:30〜\n13:00〜\n16:00〜\n水土\n9:00〜\n16:00〜
+    weekday_group_re = re.compile(r"^[月火水木金土日]+$")
+    has_weekday_groups = any(weekday_group_re.match(line) for line in lines)
+
+    if has_weekday_groups:
+        groups = []
+        current_weekdays = None
+        current_times = []
+
+        for line in lines:
+            if weekday_group_re.match(line):
+                # 前のグループを保存
+                if current_weekdays is not None:
+                    groups.append((current_weekdays, current_times))
+                current_weekdays = list(line)
+                current_times = []
+            elif current_weekdays is not None:
+                # 時刻パターン (9:30〜 等)
+                m = re.match(r"(\d{1,2}:\d{2})[〜~]?$", line)
+                if m:
+                    t = m.group(1)
+                    parts = t.split(":")
+                    current_times.append(f"{int(parts[0]):02d}:{parts[1]}")
+
+        # 最後のグループを保存
+        if current_weekdays is not None:
+            groups.append((current_weekdays, current_times))
+
+        results = []
+        for weekdays, times in groups:
+            for wd in weekdays:
+                if times:
+                    for t in times:
+                        results.append({
+                            "weekday": wd,
+                            "duration": base_duration,
+                            "fixed_time": t,
+                            "afternoon": False,
+                        })
+                else:
+                    # 固定時間なしのグループ → times_per_day で展開
+                    for _ in range(times_per_day):
+                        results.append({
+                            "weekday": wd,
+                            "duration": base_duration,
+                            "fixed_time": None,
+                            "afternoon": False,
+                        })
+        return results
+
+    # --- 以下: 標準パターン (週N回 形式) ---
 
     # --- 週N回 / 曜日の抽出 ---
     freq = 0
@@ -324,20 +393,6 @@ def parse_visit_schedule(visit_str):
             weekdays = ["水"]
         else:
             weekdays = WEEKDAY_NAMES[:5]  # フォールバック: 平日
-
-    # --- 1日N回 ---
-    times_per_day = 1
-    for line in lines:
-        m = re.search(r"1日(\d+)回", line)
-        if m:
-            times_per_day = int(m.group(1))
-
-    # --- 基本所要時間 ---
-    base_duration = 30  # デフォルト
-    for line in lines:
-        m = re.search(r"1回(\d+)分", line)
-        if m:
-            base_duration = int(m.group(1))
 
     # --- 曜日別所要時間 (例: "月金は60分", "水は30分") ---
     weekday_durations = {}
