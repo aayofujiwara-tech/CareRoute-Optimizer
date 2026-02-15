@@ -402,7 +402,7 @@ def parse_day_service(ds_str):
     # 曜日抽出 ("回" は省略可)
     weekdays = []
     for line in lines:
-        m = re.match(r"週\d+回?[（(]([月火水木金土日]+)[)）]", line)
+        m = re.match(r"(?:デイ)?週\d+回?[（(]([月火水木金土日]+)[)）]", line)
         if m:
             weekdays = list(m.group(1))
             break
@@ -1322,6 +1322,10 @@ def main():
         except Exception as e:
             print(f"[エラー] 統合ファイルの読み込みに失敗しました: {e}")
             sys.exit(1)
+        # Unnamed列を除去 (Excelの空列対策)
+        integrated_df = integrated_df.loc[
+            :, ~integrated_df.columns.astype(str).str.startswith("Unnamed")
+        ]
         # NaN行を除去
         if "利用者名" in integrated_df.columns:
             integrated_df = integrated_df.dropna(subset=["利用者名"])
