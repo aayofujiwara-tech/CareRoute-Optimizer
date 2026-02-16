@@ -536,6 +536,120 @@ def load_room_map(room_filepath=None):
     return room_map
 
 
+# 出勤マーク (これらのマークがある日は出勤)
+EEKANGO_WORK_MARKS = {"B", "D"}
+# 休みマーク (これらのマークがある日は休み)
+EEKANGO_OFF_MARKS = {"休", "誕", "有"}
+# 除外名 (スタッフとして扱わない: 集計行・代行等)
+EEKANGO_EXCLUDE_NAMES = {"ヘルパー代行", "常勤合計", "非常勤合計", "勤務体制"}
+
+
+def load_eekango_shift(filepath, target_dates):
+    """ええかんごシフト表Excelを読み込み、標準シフトDataFrameに変換する。
+
+    フォーマット:
+      - 月次シート名: R{令和年}.{月} (例: R8.2 = 令和8年2月 = 2026年2月)
+      - Row 2: 年月ヘッダー (B=年, E=月)
+      - Row 3: 日付ヘッダー (D列〜: datetime)
+      - Row 4: 曜日ヘッダー
+      - Row 5+: スタッフ行 (B列=名前, D列〜=シフトマーク)
+      - マーク: B/D=出勤, 休/誕=休み, 空=判定ロジックで処理
+
+    Args:
+        filepath: ええかんごシフト.xlsx のパス
+        target_dates: 対象日付リスト (datetime)
+
+    Returns:
+        DataFrame (日付, スタッフ名, 開始時間, 終了時間, NG時間帯) or None
+    """
+    import openpyxl as oxl
+
+    try:
+        wb = oxl.load_workbook(filepath, data_only=True)
+    except Exception as e:
+        print(f"  [警告] ええかんごシフト読み込み失敗: {e}")
+        return None
+
+    # 対象月のシートを特定 (target_datesの最初の日付から月を取得)
+    target_month = target_dates[0]
+    reiwa_year = target_month.year - 2018  # 2019=R1, 2026=R8
+    sheet_name = f"R{reiwa_year}.{target_month.month}"
+
+    if sheet_name not in wb.sheetnames:
+        print(f"  [警告] シート「{sheet_name}」が見つかりません (シート一覧: {wb.sheetnames})")
+        return None
+
+    ws = wb[sheet_name]
+    print(f"  ええかんごシフト: シート「{sheet_name}」を使用")
+
+    # Row 3 から日付→列番号のマッピングを作成
+    date_col_map = {}  # {datetime.date: col_idx}
+    for col_idx in range(4, ws.max_column + 1):
+        cell_val = ws.cell(row=3, column=col_idx).value
+        if cell_val is not None:
+            try:
+                if isinstance(cell_val, datetime):
+                    d = cell_val.date()
+                else:
+                    d = pd.to_datetime(cell_val).date()
+                date_col_map[d] = col_idx
+            except Exception:
+                pass
+
+    # 対象日付のうち、シートに存在する日付を抽出
+    target_date_set = {}
+    for td in target_dates:
+        d = td.date() if hasattr(td, "date") else td
+        if d in date_col_map:
+            target_date_set[d] = date_col_map[d]
+
+    if not target_date_set:
+        print(f"  [警告] 対象日付がシート内に見つかりません")
+        return None
+
+    # スタッフ行を読み込み (Row 5〜)
+    staff_rows = []
+    for row_idx in range(5, ws.max_row + 1):
+        name_cell = ws.cell(row=row_idx, column=2).value
+        if name_cell is None:
+            continue
+        name = str(name_cell).strip().replace("\u3000", " ")
+        if not name or name in EEKANGO_EXCLUDE_NAMES:
+            continue
+        staff_rows.append((row_idx, name))
+
+    # シフトDataFrameの生成
+    # 出勤判定: B/Dマークがある日のみ出勤。空セルや休マークは非出勤。
+    rows = []
+    active_staff = set()
+    for target_date, col_idx in sorted(target_date_set.items()):
+        date_str = target_date.strftime("%Y-%m-%d") if hasattr(target_date, "strftime") else str(target_date)
+
+        for row_idx, name in staff_rows:
+            mark = ws.cell(row=row_idx, column=col_idx).value
+            mark_str = str(mark).strip() if mark is not None else ""
+
+            # 出勤判定: B/D マークのみ出勤
+            if mark_str not in EEKANGO_WORK_MARKS:
+                continue
+
+            active_staff.add(name)
+            rows.append({
+                "日付": date_str,
+                "スタッフ名": name,
+                "開始時間": DEFAULT_SHIFT_START,
+                "終了時間": DEFAULT_SHIFT_END,
+                "NG時間帯": DEFAULT_SHIFT_NG,
+            })
+
+    if not rows:
+        print(f"  [警告] 対象期間に出勤スタッフが見つかりません")
+        return None
+
+    print(f"  スタッフ: {len(active_staff)}名 ({', '.join(sorted(active_staff))})")
+    return pd.DataFrame(rows)
+
+
 def map_insurance_type(insurance_str):
     """保険種別文字列を判定フラグに変換する。
 
@@ -1395,30 +1509,59 @@ def main():
         else:
             active = integrated_df
 
-        # 対象日付の決定: シフトファイルがあればそこから、なければ今週の月〜日
+        # 対象日付の決定
+        # 今週の月曜日を起点とした7日間をデフォルトとする
+        today = datetime.now()
+        monday = today - timedelta(days=today.weekday())
+        target_dates = [monday + timedelta(days=i) for i in range(7)]
+
+        # シフトファイル探索 (優先順位: 01_shift標準形式 > ええかんごシフト > デフォルト)
         shift_files = sorted(glob.glob(os.path.join(SHIFT_DIR, "*.xlsx")))
         shift_files = [f for f in shift_files if not os.path.basename(f).startswith("~$")]
 
-        if shift_files:
-            # シフトファイルがあれば従来通り読み込み
-            shift_file = shift_files[-1]  # 最新
+        # ええかんごシフト探索 (01_shift/ と 00_analysis/ の両方をチェック)
+        eekango_shift_file = None
+        for search_dir in [SHIFT_DIR, os.path.join(BASE_DIR, "00_analysis")]:
+            candidates = sorted(glob.glob(os.path.join(search_dir, "*シフト*.xlsx")))
+            candidates = [f for f in candidates if not os.path.basename(f).startswith("~$")]
+            # 標準形式のシフトファイルと区別するため、ええかんご形式かどうか確認
+            for c in candidates:
+                if "ええかんご" in os.path.basename(c) or "シフト" in os.path.basename(c):
+                    eekango_shift_file = c
+                    break
+            if eekango_shift_file:
+                break
+
+        # 標準形式のシフトファイルがある場合はそちらを優先
+        standard_shift_files = [f for f in shift_files
+                                if f != eekango_shift_file]
+        if standard_shift_files:
+            shift_file = standard_shift_files[-1]
             print(f"  シフトファイル: {os.path.basename(shift_file)}")
             staff_shift = load_excel(shift_file, "01_shift")
             used_files.append(shift_file)
             target_dates = [pd.to_datetime(d) for d in staff_shift["日付"].unique()]
+        elif eekango_shift_file:
+            # ええかんごシフト形式で読み込み
+            print(f"  シフトファイル: {os.path.basename(eekango_shift_file)} (ええかんご形式)")
+            staff_shift = load_eekango_shift(eekango_shift_file, target_dates)
+            if staff_shift is not None:
+                # 00_analysis/ 内のファイルはアーカイブ対象外
+                if not eekango_shift_file.startswith(os.path.join(BASE_DIR, "00_analysis")):
+                    used_files.append(eekango_shift_file)
+            else:
+                # 読み込み失敗 → デフォルトにフォールバック
+                print("  [情報] ええかんごシフト読み込み失敗 → デフォルトシフトを使用")
+                default_staff = ["スタッフA", "スタッフB", "スタッフC", "スタッフD", "スタッフE"]
+                staff_shift = generate_default_shift(default_staff, target_dates)
         else:
-            # シフトファイルなし → 今週月〜日のデフォルトシフトを生成
+            # シフトファイルなし → デフォルトシフトを生成
             print("  [情報] シフトファイルなし → デフォルトシフトを自動生成")
-            today = datetime.now()
-            # 今週の月曜日を起点
-            monday = today - timedelta(days=today.weekday())
-            target_dates = [monday + timedelta(days=i) for i in range(7)]
-
-            # デフォルトスタッフ名 (仮) → ユーザーに要確認
             default_staff = ["スタッフA", "スタッフB", "スタッフC", "スタッフD", "スタッフE"]
             staff_shift = generate_default_shift(default_staff, target_dates)
             print(f"  デフォルトスタッフ: {', '.join(default_staff)}")
-            print(f"  対象期間: {target_dates[0].strftime('%Y-%m-%d')} ～ {target_dates[-1].strftime('%Y-%m-%d')}")
+
+        print(f"  対象期間: {target_dates[0].strftime('%Y-%m-%d')} ～ {target_dates[-1].strftime('%Y-%m-%d')}")
 
         # 部屋番号表の読み込み
         room_map = load_room_map()
